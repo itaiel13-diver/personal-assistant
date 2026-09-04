@@ -1,41 +1,50 @@
-# סטטוס — 2026-09-04 (עודכן: מעבר מ-Twilio ל-Meta ישיר)
+# סטטוס — 2026-09-04
 
-## שינוי כיוון חשוב
+## 🟢 המערכת חיה ועובדת מקצה לקצה
 
-הוחלט לוותר על Twilio לגמרי ולעבור ל-**Meta WhatsApp Business Cloud API ישירות**. הסיבה: הממשק החדש של Twilio ("Tryout UI") לא חשף איפה מגדירים custom webhook, וזה חסם את ההתקדמות. Meta הרשמי הוא גם הבחירה שהומלצה מלכתחילה (חינמי בהיקף התחלתי, בלי middleman).
+הבוט ענה בפועל בוואטסאפ ב-16:13 UTC. המחזור המלא אומת בלוגים של השרת:
 
-**כל קוד ה-Twilio הוסר** (`twilio` package, TwiML, X-Twilio-Signature) והוחלף בפרוטוקול האמיתי של Meta.
+```
+16:12:45  שיחת Gemini נפתחה (AFC enabled)
+16:13:00  POST .../gemini-3.6-flash:generateContent  →  200 OK
+16:13:02  POST /webhook                              →  200
+16:13:03  אישור מסירה חזר, זוהה כסטטוס ונענה נכון
+```
 
-## מה עובד ואומת בפועל
+## מה מחובר
 
-- **Gemini** — עדיין מחובר ועובד (`gemini-3.6-flash`, `google.genai`), זה לא השתנה.
-- **זיכרון שיחה לפי שולח, טיפול בשגיאות, retry** — נשארו זהים, לא הושפעו מהמעבר (הם ב-`assistant.py`, לא תלויים בספק ה-WhatsApp).
-- **שרת ה-webhook נכתב מחדש ל-Meta:**
-  - `GET /webhook` — handshake אימות חד-פעמי מול Meta (hub.mode/hub.verify_token/hub.challenge)
-  - `POST /webhook` — מאמת חתימת Meta (`X-Hub-Signature-256`, HMAC-SHA256), מפרש הודעה נכנסת, ושולח תשובה בקריאה נפרדת ל-Graph API (ל-Meta, בניגוד ל-Twilio, אין תשובה סינכרונית דרך ה-webhook עצמו)
-  - מתעלם בבטחה מאירועי סטטוס (delivered/read) ש-Meta שולחת לאותו webhook
-- **21 בדיקות pytest ירוקות**, כולל בדיקות ל-Graph API עצמו (URL, headers, payload נכונים) ולטיפול בכשלים (שגיאת API, שגיאת רשת — שניהם לא קורסים).
-- **נבדק ב-mutation testing** — שברתי בכוונה גם את בדיקת ה-handshake וגם את בדיקת החתימה, וידאתי שהטסטים אכן נכשלים.
+| רכיב | מצב |
+|---|---|
+| Gemini (`google.genai`, `gemini-3.6-flash`) | ✅ עובד |
+| שרת Flask ב-Render | ✅ Live — https://personal-assistant-y754.onrender.com |
+| Meta WhatsApp Cloud API — אימות webhook | ✅ עבר (200 על ה-handshake) |
+| הרשמה לשדה `messages` | ✅ Subscribed |
+| חיבור האפליקציה ל-WABA (`subscribed_apps`) | ✅ `success: true` |
+| מספר הטלפון האישי כנמען מאומת | ✅ |
+| 23 בדיקות pytest | ✅ ירוקות |
 
-## מה עדיין לא נעשה — צריך אותך
+**מזהים:** App ID `1692195671856956` · WABA ID `3170938719759730` · Phone Number ID `1301270403072151` · מספר בדיקה `+1 555 204-1960`
 
-**עוד לא הוקם App ב-Meta for Developers בכלל.** זה דורש כניסה לממשק (developers.facebook.com), לא ניתן לביצוע מהצד שלי. ההוראות המדויקות, שלב-אחר-שלב, ב-`README.md` תחת "הגדרת Meta WhatsApp Cloud API (מהתחלה)". בקצרה:
+## ⚠️ פעולה נדרשת תוך 24 שעות
 
-1. יצירת App + הוספת מוצר WhatsApp → מקבלים `PHONE_NUMBER_ID` + טוקן זמני
-2. הוספת מספר הטלפון שלך כנמען מאומת (עד 5 בלי אימות עסקי)
-3. חשיפת App Secret
-4. חיבור webhook (אחרי שמעדכנים משתני סביבה ב-Render ועושים Redeploy)
+**הטוקן הנוכחי (`WHATSAPP_TOKEN`) הוא טוקן זמני ופג תוקף כ-24 שעות אחרי שנוצר** (נוצר 04/09/2026 בערך 18:50 שעון ישראל). כשיפוג — הבוט יקבל הודעות אבל לא יצליח לענות.
 
-## מה עדיין נכון מהסטטוס הקודם
+**התיקון — יצירת טוקן קבוע:**
+1. **business.facebook.com** → Business Settings → **System Users**
+2. **Add** → צור/י System User (תפקיד: Admin)
+3. **Add Assets** → בחר/י את האפליקציה "עוזר אישי" ואת חשבון ה-WhatsApp
+4. **Generate New Token** → בחר/י את האפליקציה → סמן/י הרשאה **`whatsapp_business_messaging`** (ורצוי גם `whatsapp_business_management`)
+5. בחר/י תפוגה: **Never**
+6. העתק/י את הטוקן → Render → Environment → עדכן/י את `WHATSAPP_TOKEN` → Save
 
-- **פרוס ב-Render:** https://personal-assistant-y754.onrender.com (הקוד יעודכן שם אוטומטית ב-push הבא, בהנחה ש-auto-deploy דלוק — לא מאומת מהצד שלי כי הדומיין חסום מהסביבה שלי)
-- **לא נשלח כלום בפועל ללקוחות** — הכל mocks עד כה
-- **לא שונו הגדרות תשלום**
+## מגבלות ידועות (לא באגים)
 
-## קבצים רלוונטיים
+- **Render בטיר החינמי נרדם** אחרי ~15 דקות חוסר פעילות. ההודעה הראשונה אחרי שינה עלולה לקחת 30-60 שניות. מעבר לטיר בתשלום פותר.
+- **זיכרון שיחה קצר-טווח מתאפס** בכל הפעלה מחדש של השרת (כולל אחרי שינה). עובדות בזיכרון ארוך-הטווח נשמרות.
+- **מספר הבדיקה של Meta מוגבל ל-5 נמענים מאומתים.** למספר עסקי אמיתי צריך Business Verification (Step 3 בממשק).
+- **רק הודעות טקסט נתמכות.** הקלטה קולית/תמונה מקבלות תשובה מנומסת שמסבירה זאת.
+- `get_itai_targets` ו-`update_daily_schedule` הם עדיין placeholders — אין חיבור אמיתי ל-Google Sheets.
 
-- `assistant.py` — לא השתנה במעבר הזה
-- `webhook_server.py` — נכתב מחדש לגמרי ל-Meta
-- `tests/test_webhook.py` — נכתב מחדש בהתאם
-- `.env.example` — כולל את כל משתני הסביבה החדשים עם הסבר איפה למצוא כל אחד
-- `README.md` — הוראות Meta מלאות ומעודכנות
+## הצעד הבא המתבקש
+
+חיבור אמיתי ל-Google Sheets, כדי שהעוזר יקרא ויכתוב נתוני יעדים וביקורים אמיתיים במקום הנתונים הקבועים שיש עכשיו. דורש Service Account מ-Google Cloud + שיתוף הגיליון איתו.

@@ -16,17 +16,15 @@ cp .env.example .env   # ומלא/י את GEMINI_API_KEY
 python assistant.py
 ```
 
-## הפעלת שרת ה-Webhook (וואטסאפ דרך Twilio)
+## הפעלת שרת ה-Webhook (וואטסאפ דרך Meta WhatsApp Cloud API)
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env   # ומלא/י GEMINI_API_KEY ו-TWILIO_AUTH_TOKEN
+cp .env.example .env   # ומלא/י GEMINI_API_KEY, WHATSAPP_TOKEN, PHONE_NUMBER_ID, META_APP_SECRET, META_VERIFY_TOKEN
 python webhook_server.py       # לפיתוח מקומי (Flask dev server, פורט 5000)
 # בייצור:
 gunicorn webhook_server:app --bind 0.0.0.0:$PORT
 ```
-
-לחיבור מקומי ל-Twilio Sandbox לצורך בדיקה (בלי לפרוס לענן) אפשר להשתמש ב-[ngrok](https://ngrok.com) כדי לחשוף את הפורט המקומי ל-URL ציבורי זמני, ולהגדיר אותו כ-webhook ב-Twilio Console.
 
 ## הרצת הבדיקות
 
@@ -35,13 +33,13 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-כל הבדיקות עובדות מול Mocks בלבד (לא קוראות בפועל ל-Gemini או ל-Twilio), כך שהן רצות מהר ובלי תלות ברשת או במפתחות אמיתיים.
+כל הבדיקות עובדות מול Mocks בלבד (לא קוראות בפועל ל-Gemini או ל-Meta), כך שהן רצות מהר ובלי תלות ברשת או במפתחות אמיתיים.
 
 ## מבנה
 
 - `assistant.py` — הלוגיקה הראשית: System Prompt, כלים (tools) ל-Function Calling, וניהול שיחה מתמשכת לפי שולח.
-- `webhook_server.py` — שרת Flask שמקבל הודעות נכנסות מ-Twilio (`POST /whatsapp`), מאמת שהבקשה אכן הגיעה מ-Twilio (חתימה קריפטוגרפית), מעביר את הטקסט + מזהה השולח ל-`handle_whatsapp_message`, ומחזיר את התשובה כ-TwiML.
-- `tests/` — בדיקות pytest ל-webhook (אימות חתימה, ניתוב) ול-assistant (זיכרון ארוך-טווח, ניהול שיחות לפי שולח, retry).
+- `webhook_server.py` — שרת Flask שמדבר את פרוטוקול WhatsApp Cloud API של Meta: `GET /webhook` לאימות חד-פעמי (handshake), `POST /webhook` לקבלת הודעות נכנסות (מאומת מול חתימת Meta - `X-Hub-Signature-256`), ושליחת תשובה בקריאה נפרדת ומפורשת ל-Graph API (בניגוד ל-Twilio, ל-Meta אין מנגנון תשובה סינכרוני דרך תגובת ה-webhook עצמה).
+- `tests/` — בדיקות pytest ל-webhook (handshake, אימות חתימה, שליחה בפועל ל-Graph API, טיפול באירועי סטטוס) ול-assistant (זיכרון ארוך-טווח, ניהול שיחות לפי שולח, retry).
 - `long_term_memory.json` — נוצר אוטומטית בזמן ריצה, שומר כללים/מיפויים שנלמדו מאיתי. לא נכלל ב-git (ראה `.gitignore`).
 
 ## זיכרון שיחה — איך זה עובד בפועל
@@ -53,19 +51,39 @@ pytest -v
 
 **מגבלה חשובה:** זיכרון השיחה הקצר-טווח הוא **בתוך-תהליך בלבד** — הוא מתאפס בכל הפעלה מחדש של השרת. ב-Render בטיר החינמי, השירות "נרדם" אחרי חוסר פעילות וקם מחדש בבקשה הבאה — כלומר שיחות ארוכות שנעצרות לזמן מה עלולות "לאבד" את ההקשר הקצר-טווח (העובדות בזיכרון הארוך-טווח כן נשמרות, כי הן על הדיסק). אם זה יהפוך לבעיה בפועל, הפתרון הוא זיכרון שיחה מבוסס-DB חיצוני (למשל Redis או טבלה ב-D1/Postgres) במקום דיקשנרי בזיכרון.
 
-## הגדרת Twilio Webhook
+## הגדרת Meta WhatsApp Cloud API (מהתחלה)
 
-1. ב-Twilio Console → **Messaging → Try it out → WhatsApp Sandbox**
-2. תחת **"When a message comes in"**, הדבק/י את כתובת ה-webhook הציבורית שלך + `/whatsapp` (למשל `https://your-app.onrender.com/whatsapp`)
-3. Method: **HTTP POST**
-4. שמור/י — מעכשיו כל הודעה שנשלחת למספר ה-Sandbox תגיע לשרת ותקבל תשובה מהעוזר
+### שלב 1 — יצירת App ב-Meta for Developers
 
-**הערה (2026-09-04):** Twilio עדכנו את הממשק ל-"Tryout UI" חדש; מיקום הגדרת ה-webhook השתנה מהמסך הישן ("Sandbox settings"). עדיין לא אותר המיקום המדויק בממשק החדש — זה הפריט הפתוח היחיד שמונע חיבור מלא בפועל. ראה `docs/STATUS.md`.
+1. **https://developers.facebook.com/apps** → **Create App** → סוג **"Business"**
+2. בתוך ה-App, הוסף/י את המוצר **WhatsApp**
+3. במסך **WhatsApp → API Setup** תראה/י:
+   - **מספר טלפון בדיקה זמני** (Test number) — מוכן לשימוש מיידי, בלי אימות עסקי
+   - **Phone Number ID** — זה ה-`PHONE_NUMBER_ID`
+   - **Temporary Access Token** (תוקף 24 שעות — טוב לבדיקה ראשונית בלבד, ראה שלב 4 לטוקן קבוע)
+4. באותו מסך, תחת **"To"**, הוסף/י את מספר הוואטסאפ שלך כ-**נמען מאומת** (Add recipient phone number) — עד 5 מספרים אפשריים בלי אימות עסקי, וזה הכרחי כדי שתוכל/י לקבל הודעות מהעוזר בשלב הבדיקה.
+
+### שלב 2 — App Secret
+
+**App Settings → Basic** → ליד "App Secret" לחץ/י **Show** (יבקש סיסמה) → זה ה-`META_APP_SECRET`.
+
+### שלב 3 — חיבור ה-Webhook (אחרי שהשרת פרוס ורץ)
+
+1. **WhatsApp → Configuration**
+2. **Edit** ליד Webhook
+3. **Callback URL:** `https://personal-assistant-y754.onrender.com/webhook`
+4. **Verify token:** כל מחרוזת שתבחר/י בעצמך (למשל `samsung-assistant-2026`) — **תעדכן/י את אותה מחרוזת גם ב-`META_VERIFY_TOKEN`** ב-Render (Environment Variables), ואז **Redeploy** לפני שתלחץ/י Verify כאן, אחרת האימות ייכשל
+5. לחץ/י **Verify and Save**
+6. תחת **Webhook fields**, סמן/י **Subscribe** ליד `messages`
+
+### שלב 4 — טוקן קבוע (כשה-24 שעות של הטוקן הזמני נגמרות)
+
+**Business Settings → System Users → Add** → צור/י System User → **Generate Token**, בחר/י את ה-App, ותן/י הרשאת `whatsapp_business_messaging` → זה טוקן שלא פג תוקף (בניגוד לטוקן הזמני). עדכן/י את `WHATSAPP_TOKEN` בהתאם.
 
 ## הערות אבטחה
 
-- מפתחות ה-API (`GEMINI_API_KEY`, `TWILIO_AUTH_TOKEN`) נקראים אך ורק ממשתני סביבה — אין לשמור אותם בקוד, ו-`.env` מוגן ב-`.gitignore`.
-- כל בקשת `POST /whatsapp` מאומתת מול חתימת Twilio (`X-Twilio-Signature`) — בקשה מזויפת נדחית עם 403 לפני שהיא מגיעה ל-Gemini.
+- מפתחות ה-API (`GEMINI_API_KEY`, `WHATSAPP_TOKEN`, `META_APP_SECRET`) נקראים אך ורק ממשתני סביבה — אין לשמור אותם בקוד, ו-`.env` מוגן ב-`.gitignore`.
+- כל בקשת `POST /webhook` מאומתת מול חתימת Meta (`X-Hub-Signature-256`, HMAC-SHA256 עם ה-App Secret) — בקשה מזויפת נדחית עם 403 לפני שהיא מגיעה ל-Gemini.
 - העוזר **לא** שולח הודעות/מיילים אוטומטית — תמיד יוצר טיוטה וממתין לאישור מפורש.
 - הפונקציות `get_itai_targets` ו-`update_daily_schedule` הן כרגע placeholders — האינטגרציה בפועל מול Google Sheets טרם מומשה.
 - קריאות ל-Gemini עוברות retry אוטומטי (עד 3 ניסיונות, backoff מעריכי) על שגיאות זמניות (503); כשל מתמשך מחזיר הודעת שגיאה בעברית במקום קריסה שקטה.

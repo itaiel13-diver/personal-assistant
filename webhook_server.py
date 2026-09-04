@@ -1,9 +1,10 @@
-import os
+import hashlib
+import hmac
 import logging
+import os
 
-from flask import Flask, request, abort
-from twilio.request_validator import RequestValidator
-from twilio.twiml.messaging_response import MessagingResponse
+import requests
+from flask import Flask, Response, abort, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from assistant import handle_whatsapp_message
@@ -13,42 +14,100 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 # Render (and most PaaS) terminate TLS at a proxy and forward requests as
-# plain HTTP internally. Without this, request.url is http://... while
-# Twilio signs against the public https://... URL, so signature
-# validation below would fail on every single request.
+# plain HTTP internally. Without this, request.url is http://... which
+# breaks anything relying on the public scheme.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN")
+META_APP_SECRET = os.environ.get("META_APP_SECRET")
+WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v21.0")
 
 
-def _is_valid_twilio_request(req) -> bool:
-    """Confirms a webhook POST actually came from Twilio, not a spoofed request."""
-    if not TWILIO_AUTH_TOKEN:
-        logger.error("TWILIO_AUTH_TOKEN is not set — rejecting webhook request.")
+def _is_valid_meta_signature(req) -> bool:
+    """Confirms a webhook POST actually came from Meta, not a spoofed request.
+    Meta signs the raw request body with the app secret (HMAC-SHA256)."""
+    if not META_APP_SECRET:
+        logger.error("META_APP_SECRET is not set — rejecting webhook request.")
         return False
-    signature = req.headers.get("X-Twilio-Signature", "")
-    validator = RequestValidator(TWILIO_AUTH_TOKEN)
-    return validator.validate(req.url, req.form, signature)
+    signature_header = req.headers.get("X-Hub-Signature-256", "")
+    if not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(META_APP_SECRET.encode("utf-8"), req.get_data(), hashlib.sha256).hexdigest()
+    provided = signature_header[len("sha256="):]
+    return hmac.compare_digest(expected, provided)
 
 
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp_webhook():
-    if not _is_valid_twilio_request(request):
+def _send_whatsapp_reply(to: str, text: str) -> None:
+    """Sends a message back via the WhatsApp Cloud API.
+    Unlike Twilio, Meta has no synchronous webhook-response reply - a reply
+    is always a separate, explicit outbound call to the Graph API."""
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        logger.error("WHATSAPP_TOKEN/PHONE_NUMBER_ID not set — cannot send reply.")
+        return
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text},
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        if r.status_code >= 400:
+            logger.error(f"WhatsApp send failed: {r.status_code} {r.text}")
+    except requests.RequestException as e:
+        logger.error(f"WhatsApp send raised an exception: {e}")
+
+
+def _extract_incoming_message(payload: dict):
+    """Returns (sender, text) for the first text message in a Meta webhook
+    payload, or (None, None) for non-message events (delivery/read receipts,
+    template status updates, etc.) which Meta also sends to this same webhook."""
+    try:
+        value = payload["entry"][0]["changes"][0]["value"]
+        messages = value.get("messages")
+        if not messages:
+            return None, None
+        message = messages[0]
+        sender = message.get("from")
+        text = message.get("text", {}).get("body", "")
+        return sender, text
+    except (KeyError, IndexError, TypeError):
+        return None, None
+
+
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    """Meta calls this once, synchronously, when you save the webhook URL in
+    the App dashboard, to prove you control this endpoint."""
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge", "")
+    if mode == "subscribe" and META_VERIFY_TOKEN and token == META_VERIFY_TOKEN:
+        return Response(challenge, status=200, mimetype="text/plain")
+    abort(403)
+
+
+@app.route("/webhook", methods=["POST"])
+def receive_webhook():
+    if not _is_valid_meta_signature(request):
         abort(403)
 
-    incoming_text = request.form.get("Body", "").strip()
-    sender = request.form.get("From", "unknown")
-    logger.info("Incoming WhatsApp message from %s", sender)
+    payload = request.get_json(silent=True) or {}
+    sender, text = _extract_incoming_message(payload)
 
-    reply_text = (
-        handle_whatsapp_message(incoming_text, sender_id=sender)
-        if incoming_text
-        else "לא התקבלה הודעה."
-    )
+    if sender and text:
+        reply_text = handle_whatsapp_message(text.strip(), sender_id=sender)
+        _send_whatsapp_reply(sender, reply_text)
+    else:
+        logger.info("Webhook event with no incoming text message — ignored.")
 
-    twiml = MessagingResponse()
-    twiml.message(reply_text)
-    return str(twiml), 200, {"Content-Type": "text/xml"}
+    # Meta requires a fast 2xx regardless of content; a non-2xx (or a slow
+    # response) makes it retry, and repeated failures can disable the webhook.
+    return "OK", 200
 
 
 @app.route("/", methods=["GET"])

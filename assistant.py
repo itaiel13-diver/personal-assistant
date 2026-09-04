@@ -188,7 +188,11 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
     except Exception as e:
         logger.error(f"Gemini call failed for sender {sender_id}: {e}")
         return "מצטער, יש כרגע תקלה זמנית בחיבור ל-AI. נסה/י שוב בעוד רגע."
-    return response.text
+    # response.text is None (not an exception) when there are no text parts -
+    # e.g. a safety-blocked response. Sending None onward would reach the
+    # WhatsApp API as a null body and fail silently, leaving the sender with
+    # no reply and no clue why.
+    return response.text or "לא הצלחתי לייצר תשובה להודעה הזו. אפשר לנסח את זה קצת אחרת?"
 
 if __name__ == "__main__":
     print("🤖 העוזר האישי מוכן לפעולה!")

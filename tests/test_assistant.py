@@ -93,6 +93,22 @@ def test_handle_whatsapp_message_returns_hebrew_fallback_when_session_creation_f
     assert "brand-new-sender" not in assistant._sessions  # no half-broken state left behind
 
 
+def test_handle_whatsapp_message_falls_back_when_response_has_no_text(monkeypatch):
+    """response.text is None (not an exception) for a safety-blocked or
+    non-text-only response. Sending None onward would reach WhatsApp as a
+    null body and fail silently - must substitute a real string instead."""
+    fake_chat = MagicMock()
+    fake_response = MagicMock()
+    fake_response.text = None
+    fake_chat.send_message.return_value = fake_response
+    fake_client = MagicMock()
+    fake_client.chats.create.return_value = fake_chat
+    monkeypatch.setattr(assistant, "client", fake_client)
+
+    result = assistant.handle_whatsapp_message("test", sender_id="sender-y")
+    assert isinstance(result, str) and len(result) > 0
+
+
 def test_handle_whatsapp_message_returns_hebrew_fallback_on_persistent_failure(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda _: None)
     fake_chat = MagicMock()

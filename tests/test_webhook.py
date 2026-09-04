@@ -42,6 +42,31 @@ def _text_message_payload(sender: str, text: str) -> dict:
     }
 
 
+def _image_message_payload(sender: str) -> dict:
+    """A real message, but of a type this bot doesn't handle (voice notes and
+    locations look the same shape-wise - just a different 'type' and no 'text' key)."""
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "entry-id",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {"phone_number_id": "123"},
+                    "messages": [{
+                        "from": sender,
+                        "id": "wamid.test",
+                        "timestamp": "1234567890",
+                        "image": {"id": "media-id", "mime_type": "image/jpeg"},
+                        "type": "image",
+                    }],
+                },
+                "field": "messages",
+            }],
+        }],
+    }
+
+
 def _status_update_payload() -> dict:
     """Meta also posts delivery/read receipts to the same webhook - no 'messages' key."""
     return {
@@ -120,6 +145,22 @@ def test_valid_text_message_triggers_reply(client):
     assert r.status_code == 200
     mock_handle.assert_called_once_with("שלום", sender_id="972500000000")
     mock_send.assert_called_once_with("972500000000", "תשובת בדיקה")
+
+
+def test_unsupported_message_type_gets_graceful_reply_not_silence(client):
+    """An image/voice-note/location message must not be a black hole -
+    Gemini isn't called (nothing to feed it), but the sender gets a reply."""
+    body = json.dumps(_image_message_payload("972500000000")).encode()
+    with patch("webhook_server.handle_whatsapp_message") as mock_handle, \
+         patch("webhook_server._send_whatsapp_reply") as mock_send:
+        r = client.post(
+            "/webhook", data=body, content_type="application/json",
+            headers={"X-Hub-Signature-256": _sign(body)},
+        )
+    assert r.status_code == 200
+    mock_handle.assert_not_called()
+    mock_send.assert_called_once()
+    assert mock_send.call_args[0][0] == "972500000000"
 
 
 def test_status_update_is_acknowledged_without_processing(client):

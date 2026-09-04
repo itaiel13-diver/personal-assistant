@@ -63,20 +63,25 @@ def _send_whatsapp_reply(to: str, text: str) -> None:
 
 
 def _extract_incoming_message(payload: dict):
-    """Returns (sender, text) for the first text message in a Meta webhook
-    payload, or (None, None) for non-message events (delivery/read receipts,
-    template status updates, etc.) which Meta also sends to this same webhook."""
+    """Returns (sender, text, message_type) for the first message in a Meta
+    webhook payload, or (None, None, None) for non-message events
+    (delivery/read receipts, template status updates, etc.) which Meta also
+    sends to this same webhook. message_type is Meta's own type string
+    ('text', 'image', 'audio', 'location', ...) so the caller can tell a real
+    but unsupported message (which deserves a reply) apart from no message
+    at all (which doesn't)."""
     try:
         value = payload["entry"][0]["changes"][0]["value"]
         messages = value.get("messages")
         if not messages:
-            return None, None
+            return None, None, None
         message = messages[0]
         sender = message.get("from")
-        text = message.get("text", {}).get("body", "")
-        return sender, text
+        message_type = message.get("type", "unknown")
+        text = message.get("text", {}).get("body", "") if message_type == "text" else ""
+        return sender, text, message_type
     except (KeyError, IndexError, TypeError):
-        return None, None
+        return None, None, None
 
 
 @app.route("/webhook", methods=["GET"])
@@ -97,13 +102,18 @@ def receive_webhook():
         abort(403)
 
     payload = request.get_json(silent=True) or {}
-    sender, text = _extract_incoming_message(payload)
+    sender, text, message_type = _extract_incoming_message(payload)
 
-    if sender and text:
+    if sender and message_type == "text" and text:
         reply_text = handle_whatsapp_message(text.strip(), sender_id=sender)
         _send_whatsapp_reply(sender, reply_text)
+    elif sender and message_type is not None:
+        # A real message of a type we don't handle (voice note, image, location...) -
+        # reply so the person knows the bot saw it, instead of silence that looks broken.
+        logger.info(f"Unsupported message type '{message_type}' from {sender} — replying with guidance.")
+        _send_whatsapp_reply(sender, "כרגע אני תומך רק בהודעות טקסט. אפשר לתאר את זה במילים? 🙂")
     else:
-        logger.info("Webhook event with no incoming text message — ignored.")
+        logger.info("Webhook event with no incoming message (status update, etc.) — ignored.")
 
     # Meta requires a fast 2xx regardless of content; a non-2xx (or a slow
     # response) makes it retry, and repeated failures can disable the webhook.

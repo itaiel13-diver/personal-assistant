@@ -78,6 +78,21 @@ def test_send_with_retry_gives_up_after_max_attempts(monkeypatch):
     assert chat.send_message.call_count == 2
 
 
+def test_handle_whatsapp_message_returns_hebrew_fallback_when_session_creation_fails(monkeypatch):
+    """A brand-new sender whose very first session creation fails must still get the
+    graceful fallback, not a raw exception - this is a distinct code path from a
+    send_message failure on an already-open session."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    err = assistant.genai_errors.ServerError(503, {"error": {"message": "down"}}, MagicMock())
+    fake_client = MagicMock()
+    fake_client.chats.create.side_effect = err
+    monkeypatch.setattr(assistant, "client", fake_client)
+
+    result = assistant.handle_whatsapp_message("test", sender_id="brand-new-sender")
+    assert "תקלה זמנית" in result
+    assert "brand-new-sender" not in assistant._sessions  # no half-broken state left behind
+
+
 def test_handle_whatsapp_message_returns_hebrew_fallback_on_persistent_failure(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda _: None)
     fake_chat = MagicMock()

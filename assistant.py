@@ -141,25 +141,15 @@ def _load_memory_context() -> str:
 _sessions: dict[str, "genai.chats.Chat"] = {}
 
 
-def _get_session(sender_id: str):
-    if sender_id not in _sessions:
-        _sessions[sender_id] = client.chats.create(
-            model=MODEL_NAME,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT + _load_memory_context(),
-                tools=tools_list,
-            ),
-        )
-    return _sessions[sender_id]
-
-
-def _send_with_retry(chat, text: str, attempts: int = 3):
-    """Gemini's servers return transient 503s under load - retry with backoff before giving up."""
+def _retry_on_server_error(fn, attempts: int = 3):
+    """Gemini's servers return transient 503s under load - retry with backoff before giving up.
+    Used for every call to Gemini (session creation included) - a failure creating a brand new
+    session is exactly as real a failure mode as one sending a message on an existing session."""
     delay_seconds = 2
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
-            return chat.send_message(text)
+            return fn()
         except genai_errors.ServerError as e:
             last_error = e
             logger.warning(f"Gemini ServerError, attempt {attempt}/{attempts}: {e}")
@@ -169,6 +159,22 @@ def _send_with_retry(chat, text: str, attempts: int = 3):
     raise last_error
 
 
+def _get_session(sender_id: str):
+    if sender_id not in _sessions:
+        _sessions[sender_id] = _retry_on_server_error(lambda: client.chats.create(
+            model=MODEL_NAME,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT + _load_memory_context(),
+                tools=tools_list,
+            ),
+        ))
+    return _sessions[sender_id]
+
+
+def _send_with_retry(chat, text: str, attempts: int = 3):
+    return _retry_on_server_error(lambda: chat.send_message(text), attempts=attempts)
+
+
 # 5. מנוע השיחה הראשי
 def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> str:
     """
@@ -176,8 +182,8 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
     persistent multi-turn conversation per sender, and executes function
     calls automatically when Gemini triggers them.
     """
-    chat = _get_session(sender_id)
     try:
+        chat = _get_session(sender_id)
         response = _send_with_retry(chat, incoming_text)
     except Exception as e:
         logger.error(f"Gemini call failed for sender {sender_id}: {e}")

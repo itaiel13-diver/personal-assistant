@@ -23,7 +23,9 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # באותה שיחת בדיקה אחת), אז אין טעם לקבע אותו עמוק בקוד.
 MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-3.6-flash")
 
-MEMORY_FILE = "long_term_memory.json"
+# נתיב מוחלט, לא יחסי ל-CWD - אחרת שינוי בתיקיית ההפעלה (למשל gunicorn
+# שמופעל מתיקייה אחרת) גורם לזיכרון להיכתב/להיקרא מהמקום הלא נכון בשקט.
+MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "long_term_memory.json")
 
 # 2. ה-System Prompt המקיף והמלא
 SYSTEM_PROMPT = """

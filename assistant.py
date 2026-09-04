@@ -108,7 +108,7 @@ def update_daily_schedule(store_name: str, status: str, notes: str) -> str:
 tools_list = [save_to_long_term_memory, get_itai_targets, update_daily_schedule]
 
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-flash-latest",
     system_instruction=SYSTEM_PROMPT,
     tools=tools_list
 )

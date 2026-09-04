@@ -1,8 +1,11 @@
 import os
 import json
 import logging
-from typing import Dict, Any, List
-import google.generativeai as genai
+import time
+
+from google import genai
+from google.genai import types
+from google.genai import errors as genai_errors
 
 # הגדרת הלוגים למעקב
 logging.basicConfig(level=logging.INFO)
@@ -13,7 +16,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY is not set in environment variables.")
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# שם המודל ניתן לדריסה דרך משתנה סביבה - שמות מודלים מתיישנים בלי אזהרה
+# (ראינו את זה בפועל: gemini-1.5-flash ואז gemini-2.5-flash הפסיקו לעבוד
+# באותה שיחת בדיקה אחת), אז אין טעם לקבע אותו עמוק בקוד.
+MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-3.6-flash")
+
+MEMORY_FILE = "long_term_memory.json"
 
 # 2. ה-System Prompt המקיף והמלא
 SYSTEM_PROMPT = """
@@ -65,12 +75,11 @@ COMMUNICATION STYLE:
 
 def save_to_long_term_memory(key: str, value: str, category: str = "general") -> str:
     """Saves a new learned rule, store mapping, or preference into the long-term memory JSON file."""
-    memory_file = "long_term_memory.json"
     memory_data = {}
 
-    if os.path.exists(memory_file):
+    if os.path.exists(MEMORY_FILE):
         try:
-            with open(memory_file, "r", encoding="utf-8") as f:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 memory_data = json.load(f)
         except Exception as e:
             logger.error(f"Error reading memory file: {e}")
@@ -81,7 +90,7 @@ def save_to_long_term_memory(key: str, value: str, category: str = "general") ->
     }
 
     try:
-        with open(memory_file, "w", encoding="utf-8") as f:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
             json.dump(memory_data, f, ensure_ascii=False, indent=2)
         return f"✅ הזיכרון עודכן בהצלחה: {key} = {value}"
     except Exception as e:
@@ -104,40 +113,77 @@ def update_daily_schedule(store_name: str, status: str, notes: str) -> str:
     # כאן ייכנס הקוד הייעודי לעדכון שורה ב-Google Sheets
     return f"✅ עודכן בהצלחה בלו\"ז: ביקור ב-{store_name} מסומן כ-{status}."
 
-# 4. אתחול המודל עם ה-Tools וה-System Prompt
 tools_list = [save_to_long_term_memory, get_itai_targets, update_daily_schedule]
 
-model = genai.GenerativeModel(
-    model_name="gemini-flash-latest",
-    system_instruction=SYSTEM_PROMPT,
-    tools=tools_list
-)
+
+def _load_memory_context() -> str:
+    """Renders long-term memory as extra system context, for injection when a session starts."""
+    if not os.path.exists(MEMORY_FILE):
+        return ""
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            mem = json.load(f)
+        if not mem:
+            return ""
+        return f"\n\n[LONG TERM MEMORY]: {json.dumps(mem, ensure_ascii=False)}"
+    except Exception as e:
+        logger.error(f"Failed to load memory: {e}")
+        return ""
+
+
+# 4. שיחות מתמשכות לפי שולח
+# כל שולח (מספר וואטסאפ) מקבל אובייקט Chat אחד שנשמר לאורך חיי התהליך, כך
+# שהעוזר זוכר את מהלך השיחה הנוכחי ולא רק עובדות מהזיכרון ארוך-הטווח.
+# הערה: זה זיכרון בתוך-תהליך בלבד - הוא מתאפס בכל הפעלה מחדש של השרת
+# (למשל Render בטיר החינמי שנרדם אחרי חוסר פעילות).
+_sessions: dict[str, "genai.chats.Chat"] = {}
+
+
+def _get_session(sender_id: str):
+    if sender_id not in _sessions:
+        _sessions[sender_id] = client.chats.create(
+            model=MODEL_NAME,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT + _load_memory_context(),
+                tools=tools_list,
+            ),
+        )
+    return _sessions[sender_id]
+
+
+def _send_with_retry(chat, text: str, attempts: int = 3):
+    """Gemini's servers return transient 503s under load - retry with backoff before giving up."""
+    delay_seconds = 2
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return chat.send_message(text)
+        except genai_errors.ServerError as e:
+            last_error = e
+            logger.warning(f"Gemini ServerError, attempt {attempt}/{attempts}: {e}")
+            if attempt < attempts:
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
+    raise last_error
+
 
 # 5. מנוע השיחה הראשי
-def handle_whatsapp_message(incoming_text: str, chat_history: List[Dict[str, Any]] = None) -> str:
+def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> str:
     """
-    Handles incoming messages from WhatsApp, maintains chat context,
-    and executes function calls automatically if triggered by Gemini.
+    Handles an incoming WhatsApp message from a given sender, keeping a
+    persistent multi-turn conversation per sender, and executes function
+    calls automatically when Gemini triggers them.
     """
-    # טעינת הזיכרון הקיים לתוך פתיחת השיחה
-    memory_context = ""
-    if os.path.exists("long_term_memory.json"):
-        try:
-            with open("long_term_memory.json", "r", encoding="utf-8") as f:
-                mem = json.load(f)
-                memory_context = f"\n[LONG TERM MEMORY LOADED]: {json.dumps(mem, ensure_ascii=False)}\n"
-        except Exception as e:
-            logger.error(f"Failed to load memory: {e}")
-
-    full_prompt = f"{memory_context}\nהודעה נכנסת מאיתי: {incoming_text}"
-
-    chat = model.start_chat(enable_automatic_function_calling=True)
-    response = chat.send_message(full_prompt)
-
+    chat = _get_session(sender_id)
+    try:
+        response = _send_with_retry(chat, incoming_text)
+    except Exception as e:
+        logger.error(f"Gemini call failed for sender {sender_id}: {e}")
+        return "מצטער, יש כרגע תקלה זמנית בחיבור ל-AI. נסה/י שוב בעוד רגע."
     return response.text
 
 if __name__ == "__main__":
     print("🤖 העוזר האישי מוכן לפעולה!")
     # בדיקת ניסיון להפעלה מקומית
-    # test_response = handle_whatsapp_message("היי, תזכיר לי איזה סניף זה אלם רחובות והאם הוספנו אותו לזיכרון?")
+    # test_response = handle_whatsapp_message("היי, תזכיר לי איזה סניף זה אלם רחובות והאם הוספנו אותו לזיכרון?", "local-test")
     # print(test_response)

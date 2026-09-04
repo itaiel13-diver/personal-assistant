@@ -41,7 +41,7 @@ def whatsapp_webhook():
     logger.info("Incoming WhatsApp message from %s", sender)
 
     reply_text = (
-        handle_whatsapp_message(incoming_text)
+        handle_whatsapp_message(incoming_text, sender_id=sender)
         if incoming_text
         else "לא התקבלה הודעה."
     )

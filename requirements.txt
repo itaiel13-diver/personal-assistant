@@ -1,4 +1,4 @@
-google-generativeai
+google-genai
 flask
 twilio
 gunicorn

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+service-account.json
 long_term_memory.json
 .venv/
 venv/

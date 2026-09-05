@@ -1,5 +1,6 @@
 import json
 import time
+from datetime import timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -46,6 +47,25 @@ def test_get_session_reuses_same_chat_for_same_sender(monkeypatch):
     chat2 = assistant._get_session("sender-a")
     assert chat1 is chat2
     assert fake_client.chats.create.call_count == 1
+
+
+def test_get_session_is_rebuilt_when_the_date_changes(monkeypatch):
+    """The current date is baked into the system instruction, so a session that
+    survived midnight would keep believing 'today' is yesterday and schedule
+    calendar events on the wrong day."""
+    fake_client = MagicMock()
+    fake_client.chats.create.side_effect = lambda **kwargs: MagicMock()
+    monkeypatch.setattr(assistant, "client", fake_client)
+
+    assistant._get_session("sender-a")
+    assert fake_client.chats.create.call_count == 1
+
+    # Simulate the clock rolling into the next day.
+    stale_chat, stale_date = assistant._sessions["sender-a"]
+    assistant._sessions["sender-a"] = (stale_chat, stale_date - timedelta(days=1))
+
+    assistant._get_session("sender-a")
+    assert fake_client.chats.create.call_count == 2
 
 
 def test_get_session_isolates_different_senders(monkeypatch):

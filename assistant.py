@@ -2,10 +2,13 @@ import os
 import json
 import logging
 import time
+from datetime import datetime
 
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
+
+from calendar_tools import ISRAEL_TZ, create_calendar_event, get_calendar_events
 
 # הגדרת הלוגים למעקב
 logging.basicConfig(level=logging.INFO)
@@ -115,7 +118,13 @@ def update_daily_schedule(store_name: str, status: str, notes: str) -> str:
     # כאן ייכנס הקוד הייעודי לעדכון שורה ב-Google Sheets
     return f"✅ עודכן בהצלחה בלו\"ז: ביקור ב-{store_name} מסומן כ-{status}."
 
-tools_list = [save_to_long_term_memory, get_itai_targets, update_daily_schedule]
+tools_list = [
+    save_to_long_term_memory,
+    get_itai_targets,
+    update_daily_schedule,
+    get_calendar_events,
+    create_calendar_event,
+]
 
 
 def _load_memory_context() -> str:
@@ -138,7 +147,10 @@ def _load_memory_context() -> str:
 # שהעוזר זוכר את מהלך השיחה הנוכחי ולא רק עובדות מהזיכרון ארוך-הטווח.
 # הערה: זה זיכרון בתוך-תהליך בלבד - הוא מתאפס בכל הפעלה מחדש של השרת
 # (למשל Render בטיר החינמי שנרדם אחרי חוסר פעילות).
-_sessions: dict[str, "genai.chats.Chat"] = {}
+# הערך הוא (אובייקט השיחה, התאריך שבו נוצרה) - התאריך נשמר כי הוא מוזרק
+# ל-system instruction, וסשן ששרד חצות היה ממשיך לחשוב שהיום הוא אתמול
+# ולקבוע אירועים ביום הלא נכון.
+_sessions: dict[str, tuple] = {}
 
 
 def _retry_on_server_error(fn, attempts: int = 3):
@@ -159,16 +171,26 @@ def _retry_on_server_error(fn, attempts: int = 3):
     raise last_error
 
 
+def _date_context() -> str:
+    """Without this the model has no idea what 'today' or 'tomorrow' mean, and would
+    schedule calendar events on arbitrary dates."""
+    now = datetime.now(ISRAEL_TZ)
+    return f"\n\n[CURRENT DATE AND TIME IN ISRAEL]: {now.strftime('%A, %d/%m/%Y, %H:%M')}"
+
+
 def _get_session(sender_id: str):
-    if sender_id not in _sessions:
-        _sessions[sender_id] = _retry_on_server_error(lambda: client.chats.create(
+    today = datetime.now(ISRAEL_TZ).date()
+    cached = _sessions.get(sender_id)
+    if cached is None or cached[1] != today:
+        chat = _retry_on_server_error(lambda: client.chats.create(
             model=MODEL_NAME,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT + _load_memory_context(),
+                system_instruction=SYSTEM_PROMPT + _load_memory_context() + _date_context(),
                 tools=tools_list,
             ),
         ))
-    return _sessions[sender_id]
+        _sessions[sender_id] = (chat, today)
+    return _sessions[sender_id][0]
 
 
 def _send_with_retry(chat, text: str, attempts: int = 3):

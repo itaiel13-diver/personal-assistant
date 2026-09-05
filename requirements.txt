@@ -1,4 +1,5 @@
 google-genai
+google-api-python-client
 flask
 requests
 gunicorn

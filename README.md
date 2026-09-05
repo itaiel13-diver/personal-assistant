@@ -39,7 +39,8 @@ pytest -v
 
 - `assistant.py` — הלוגיקה הראשית: System Prompt, כלים (tools) ל-Function Calling, וניהול שיחה מתמשכת לפי שולח.
 - `webhook_server.py` — שרת Flask שמדבר את פרוטוקול WhatsApp Cloud API של Meta: `GET /webhook` לאימות חד-פעמי (handshake), `POST /webhook` לקבלת הודעות נכנסות (מאומת מול חתימת Meta - `X-Hub-Signature-256`), ושליחת תשובה בקריאה נפרדת ומפורשת ל-Graph API (בניגוד ל-Twilio, ל-Meta אין מנגנון תשובה סינכרוני דרך תגובת ה-webhook עצמה).
-- `tests/` — בדיקות pytest ל-webhook (handshake, אימות חתימה, שליחה בפועל ל-Graph API, טיפול באירועי סטטוס) ול-assistant (זיכרון ארוך-טווח, ניהול שיחות לפי שולח, retry).
+- `calendar_tools.py` — חיבור ל-Google Calendar דרך Service Account: קריאת אירועים וקביעת אירועים חדשים, הכל באזור זמן ישראל.
+- `tests/` — בדיקות pytest ל-webhook (handshake, אימות חתימה, שליחה בפועל ל-Graph API, טיפול באירועי סטטוס), ל-assistant (זיכרון ארוך-טווח, ניהול שיחות לפי שולח, retry, רענון יומי של הסשן) וליומן (פורמט אירועים, אזור זמן, טיפול בשגיאות).
 - `long_term_memory.json` — נוצר אוטומטית בזמן ריצה, שומר כללים/מיפויים שנלמדו מאיתי. לא נכלל ב-git (ראה `.gitignore`).
 
 ## זיכרון שיחה — איך זה עובד בפועל
@@ -79,6 +80,21 @@ pytest -v
 ### שלב 4 — טוקן קבוע (כשה-24 שעות של הטוקן הזמני נגמרות)
 
 **Business Settings → System Users → Add** → צור/י System User → **Generate Token**, בחר/י את ה-App, ותן/י הרשאת `whatsapp_business_messaging` → זה טוקן שלא פג תוקף (בניגוד לטוקן הזמני). עדכן/י את `WHATSAPP_TOKEN` בהתאם.
+
+## הגדרת Google Calendar
+
+העוזר קורא וכותב ליומן דרך **Service Account** — לא דרך התחברות אישית, כך שאין טוקן שפג תוקף.
+
+1. **Google Cloud Console** → הפעל/י את **Google Calendar API**
+2. **IAM & Admin → Service Accounts** → צור/י Service Account (בלי תפקידים ברמת הפרויקט)
+3. בלשונית **Keys** → Add Key → **JSON** → יורד קובץ
+4. תוכן הקובץ כולו נכנס כמשתנה סביבה `GOOGLE_SERVICE_ACCOUNT_JSON` (שורה אחת)
+5. **calendar.google.com** → היומן הרצוי → ⋮ → הגדרות ושיתוף → **שיתוף עם אנשים ספציפיים** → הוסף/י את כתובת ה-Service Account עם הרשאת **"שינויים באירועים"**
+6. `GOOGLE_CALENDAR_ID` = כתובת בעל היומן ששיתפת
+
+**שתי מלכודות שנתקלנו בהן בפועל:**
+- ל-Service Account יש יומן `primary` **משלו** (ריק). חייבים לציין `GOOGLE_CALENDAR_ID` מפורשות, אחרת קוראים יומן ריק.
+- `calendarList` של Service Account נשאר **ריק** גם אחרי שיתוף תקין — זה לא סימן לתקלה. גישה ישירה לפי מזהה היומן עובדת בכל זאת.
 
 ## הערות אבטחה
 

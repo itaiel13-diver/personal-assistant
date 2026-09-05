@@ -207,6 +207,13 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
     try:
         chat = _get_session(sender_id)
         response = _send_with_retry(chat, incoming_text)
+    except genai_errors.ClientError as e:
+        logger.error(f"Gemini client error for sender {sender_id}: {e}")
+        # A 429 on the free tier is a daily quota that will not clear on a retry,
+        # so telling the sender "temporary, try again in a moment" would be a lie.
+        if getattr(e, "code", None) == 429:
+            return "נגמרה מכסת השימוש היומית ב-AI. היא מתאפסת מחר, או שאפשר לשדרג את התוכנית."
+        return "מצטער, יש תקלה בחיבור ל-AI. נסה/י שוב בעוד רגע."
     except Exception as e:
         logger.error(f"Gemini call failed for sender {sender_id}: {e}")
         return "מצטער, יש כרגע תקלה זמנית בחיבור ל-AI. נסה/י שוב בעוד רגע."

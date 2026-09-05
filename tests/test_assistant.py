@@ -129,6 +129,22 @@ def test_handle_whatsapp_message_falls_back_when_response_has_no_text(monkeypatc
     assert isinstance(result, str) and len(result) > 0
 
 
+def test_quota_exhaustion_says_quota_not_try_again_in_a_moment(monkeypatch):
+    """A free-tier 429 is a daily quota - it will not clear on a retry, so the
+    generic 'temporary, try again in a moment' message would be misleading."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    fake_chat = MagicMock()
+    err = assistant.genai_errors.ClientError(429, {"error": {"message": "quota"}}, MagicMock())
+    fake_chat.send_message.side_effect = err
+    fake_client = MagicMock()
+    fake_client.chats.create.return_value = fake_chat
+    monkeypatch.setattr(assistant, "client", fake_client)
+
+    result = assistant.handle_whatsapp_message("test", sender_id="sender-q")
+    assert "מכסת השימוש היומית" in result
+    assert "בעוד רגע" not in result
+
+
 def test_handle_whatsapp_message_returns_hebrew_fallback_on_persistent_failure(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda _: None)
     fake_chat = MagicMock()

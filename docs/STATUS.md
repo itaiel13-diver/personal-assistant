@@ -25,17 +25,15 @@
 
 **מזהים:** App ID `1692195671856956` · WABA ID `3170938719759730` · Phone Number ID `1301270403072151` · מספר בדיקה `+1 555 204-1960`
 
-## ⚠️ פעולה נדרשת תוך 24 שעות
+## ✅ טוקן קבוע הותקן (2026-09-05)
 
-**הטוקן הנוכחי (`WHATSAPP_TOKEN`) הוא טוקן זמני ופג תוקף כ-24 שעות אחרי שנוצר** (נוצר 04/09/2026 בערך 18:50 שעון ישראל). כשיפוג — הבוט יקבל הודעות אבל לא יצליח לענות.
+הטוקן הזמני (24 שעות) הוחלף בטוקן **System User ללא תפוגה**, ולכן הבוט לא ייפול מעצמו.
 
-**התיקון — יצירת טוקן קבוע:**
-1. **business.facebook.com** → Business Settings → **System Users**
-2. **Add** → צור/י System User (תפקיד: Admin)
-3. **Add Assets** → בחר/י את האפליקציה "עוזר אישי" ואת חשבון ה-WhatsApp
-4. **Generate New Token** → בחר/י את האפליקציה → סמן/י הרשאה **`whatsapp_business_messaging`** (ורצוי גם `whatsapp_business_management`)
-5. בחר/י תפוגה: **Never**
-6. העתק/י את הטוקן → Render → Environment → עדכן/י את `WHATSAPP_TOKEN` → Save
+- System User: `whatsapp-bot` (ID `61594093921569`), הרשאת Admin, גישה מלאה לאפליקציה "עוזר אישי"
+- הרשאות הטוקן: `whatsapp_business_messaging`, `whatsapp_business_management`
+- תפוגה: **Never**
+
+אומת בלוגים ב-20:13-20:14 UTC: שלושה מחזורי הודעה מלאים, כולל קריאת פונקציה אחת (`AFC remote call 1 is done`), ואפס שגיאות שליחה.
 
 ## מגבלות ידועות (לא באגים)
 

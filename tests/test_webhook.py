@@ -211,3 +211,35 @@ def test_malformed_payload_does_not_crash(client):
         )
     assert r.status_code == 200
     mock_handle.assert_not_called()
+
+
+def test_a_long_reply_is_split_instead_of_being_rejected():
+    """Meta rejects a body over 4096 chars. The rejection was only logged, so a
+    long answer reached the sender as complete silence."""
+    parts = webhook_server._split_for_whatsapp("א" * 10_000)
+    assert len(parts) > 1
+    assert all(len(p) <= webhook_server.WHATSAPP_MAX_BODY for p in parts)
+    assert "".join(parts) == "א" * 10_000
+
+
+def test_splitting_prefers_line_boundaries_so_rows_stay_intact():
+    rows = "\n".join(f"{i}: סניף {i} | רמלה | איתי" for i in range(400))
+    for part in webhook_server._split_for_whatsapp(rows):
+        for line in part.split("\n"):
+            assert line == "" or line.startswith(tuple("0123456789"))
+
+
+def test_a_short_reply_is_sent_as_one_message():
+    assert webhook_server._split_for_whatsapp("שלום") == ["שלום"]
+
+
+def test_every_chunk_of_a_long_reply_is_actually_sent():
+    with patch.object(webhook_server, "requests") as requests_mock:
+        requests_mock.post.return_value.status_code = 200
+        with patch.object(webhook_server, "WHATSAPP_TOKEN", "t"), \
+             patch.object(webhook_server, "PHONE_NUMBER_ID", "p"):
+            webhook_server._send_whatsapp_reply("972500000000", "ב" * 9000)
+    assert requests_mock.post.call_count == 3
+    bodies = [c.kwargs["json"]["text"]["body"] for c in requests_mock.post.call_args_list]
+    assert all(b.startswith("(") for b in bodies), "numbering is missing"
+    assert all(len(b) <= webhook_server.WHATSAPP_MAX_BODY for b in bodies)

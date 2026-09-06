@@ -39,6 +39,42 @@ def _is_valid_meta_signature(req) -> bool:
     return hmac.compare_digest(expected, provided)
 
 
+# Meta rejects a text body over 4096 characters outright. The rejection was only
+# logged, so a long answer reached the sender as nothing at all - which looks
+# identical to the assistant ignoring the question.
+WHATSAPP_MAX_BODY = 4096
+
+
+def _split_for_whatsapp(text: str, limit: int = WHATSAPP_MAX_BODY) -> list:
+    """Splits a long reply into sendable chunks, preferring paragraph then line
+    boundaries so a table of results is not cut through the middle of a row."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks, current = [], ""
+    for block in text.split("\n"):
+        while len(block) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            # A single line longer than the limit has no boundary to use.
+            chunks.append(block[:limit])
+            block = block[limit:]
+        if not current:
+            current = block
+        elif len(current) + 1 + len(block) <= limit:
+            current = f"{current}\n{block}"
+        else:
+            chunks.append(current)
+            current = block
+    if current:
+        chunks.append(current)
+    return [c for c in chunks if c.strip()]
+
+
 def _send_whatsapp_reply(to: str, text: str) -> None:
     """Sends a message back via the WhatsApp Cloud API.
     Unlike Twilio, Meta has no synchronous webhook-response reply - a reply
@@ -48,18 +84,24 @@ def _send_whatsapp_reply(to: str, text: str) -> None:
         return
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text},
-    }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=15)
-        if r.status_code >= 400:
-            logger.error(f"WhatsApp send failed: {r.status_code} {r.text}")
-    except requests.RequestException as e:
-        logger.error(f"WhatsApp send raised an exception: {e}")
+    parts = _split_for_whatsapp(text)
+    for index, part in enumerate(parts, start=1):
+        if len(parts) > 1:
+            part = f"({index}/{len(parts)})\n{part}"[:WHATSAPP_MAX_BODY]
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": part},
+        }
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=15)
+            if r.status_code >= 400:
+                logger.error(f"WhatsApp send failed: {r.status_code} {r.text}")
+                return
+        except requests.RequestException as e:
+            logger.error(f"WhatsApp send raised an exception: {e}")
+            return
 
 
 def _extract_incoming_message(payload: dict):

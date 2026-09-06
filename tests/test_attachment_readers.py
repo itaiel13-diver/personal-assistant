@@ -36,10 +36,18 @@ def test_xlsx_reads_every_sheet_not_just_the_first():
     assert "ב" in out and "ג" in out, "later sheets were dropped"
 
 
-def test_xlsx_caps_row_count_and_says_so():
-    raw = _xlsx({"ארוך": [[f"שורה {i}"] for i in range(ar.MAX_ROWS_PER_SHEET + 50)]})
-    out = ar.extract_text("long.xlsx", raw)
-    assert "עוד שורות" in out
+def test_xlsx_no_longer_stops_at_a_row_cap():
+    """The 200-row cap was removed on purpose: it hid data the owner had asked
+    for, with no way to reach it. A long sheet is now paged, and every row is
+    reachable through some part."""
+    rows = 600
+    raw = _xlsx({"ארוך": [[f"שורה {i}"] for i in range(rows)]})
+    first = ar.extract_text("long.xlsx", raw)
+    total = int(first.split("מתוך ")[1].split("]")[0]) if "מתוך " in first else 1
+    seen = "".join(ar.extract_text("long.xlsx", raw, part=n) for n in range(1, total + 1))
+    # The old cap stopped at 200; every one of the 600 has to be reachable now.
+    for i in (0, 199, 200, rows - 1):
+        assert f"שורה {i}" in seen, f"row {i} is unreachable"
 
 
 def test_csv_detects_a_semicolon_separator():
@@ -88,9 +96,13 @@ def test_oversized_files_are_refused_before_parsing():
     assert out.startswith("❌") and "גדול" in out
 
 
-def test_output_is_capped_so_it_cannot_swamp_the_prompt():
+def test_one_page_stays_within_the_prompt_budget():
+    """Output is still bounded per call - the file is paged, not dumped - but the
+    bound is now a page rather than a wall, so the rest stays reachable."""
     out = ar.extract_text("big.txt", ("א" * 50_000).encode("utf-8"))
-    assert len(out) <= ar.MAX_TEXT_CHARS + len(ar._TRUNCATION_NOTE)
+    # The page itself is capped; the header and footer are small fixed additions.
+    assert len(out) <= ar.MAX_TEXT_CHARS + 200
+    assert "אפשר לבקש את חלק 2" in out
 
 
 def test_old_excel_format_gets_a_useful_explanation():

@@ -13,6 +13,7 @@ from gmail_tools import (
     create_email_draft,
     read_email,
     read_email_attachment,
+    search_email_attachment,
     search_emails,
 )
 from calendar_tools import (
@@ -64,6 +65,19 @@ EMAIL ATTACHMENTS:
 - read_email lists the files attached to a message; read_email_attachment opens one by name.
 - When Itai asks what is in a file someone sent him, or asks a question the attached
   spreadsheet answers, open the attachment rather than answering from the mail body alone.
+- Prefer search_email_attachment whenever he wants particular rows rather than the whole
+  file - a branch, a city, a person's rows. It scans every row of the file with no limit
+  and returns only the hits, so it is both cheaper and more complete than reading.
+- Itai's territory is: ראשון לציון, רמלה, לוד, קריית אונו, קריית עקרון, יבנה, אור יהודה.
+  When he says "my cities", "my branches" or "the territory", search for all seven. Their
+  Hebrew and English spellings are expanded for you - pass the plain city name.
+- To cross-reference cities with people, put the cities in keywords and the names in
+  must_also_match. Ask him for the exact spelling of a name only if a search comes back
+  empty and you suspect the spelling.
+- NEVER stop early or say a file is too long to finish. read_email_attachment returns
+  numbered parts and tells you how many there are - if he asks for the whole file, keep
+  calling it with part=2, part=3 and so on until the last part, then answer from all of
+  them. Saying "the rest is hidden" is only correct if you have actually fetched every part.
 - Images, scanned PDFs and old .xls/.doc files cannot be read. Say so plainly and say what
   would fix it (re-saving as xlsx/docx) - never guess at contents you could not read.
 
@@ -152,6 +166,7 @@ tools_list = [
     search_emails,
     read_email,
     read_email_attachment,
+    search_email_attachment,
     create_email_draft,
 ]
 

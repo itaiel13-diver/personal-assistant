@@ -302,3 +302,77 @@ def test_inline_images_without_an_attachment_id_are_not_listed():
 def test_read_attachment_returns_an_error_string_instead_of_raising():
     with patch.object(gmail_tools, "_gmail_service", side_effect=RuntimeError("boom")):
         assert gmail_tools.read_email_attachment("m1", "a.xlsx").startswith("❌")
+
+
+def _service_serving(raw: bytes, filename="Z8 Training Status.xlsx"):
+    service = MagicMock()
+    messages = service.users.return_value.messages.return_value
+    messages.get.return_value.execute.return_value = _message_with_attachment(
+        filename, "application/octet-stream", len(raw)
+    )
+    messages.attachments.return_value.get.return_value.execute.return_value = {
+        "data": base64.urlsafe_b64encode(raw).decode()
+    }
+    return service
+
+
+def test_search_attachment_returns_only_the_matching_rows():
+    raw = _xlsx_bytes([
+        ["סניף", "עיר", "אחראי"],
+        ["א", "חיפה", "דנה"],
+        ["ב", "רמלה", "איתי"],
+    ])
+    with patch.object(gmail_tools, "_gmail_service", return_value=_service_serving(raw)):
+        result = gmail_tools.search_email_attachment("m1", "Z8", "רמלה")
+    assert "רמלה" in result
+    assert "חיפה" not in result
+
+
+def test_search_attachment_cross_references_cities_with_people():
+    raw = _xlsx_bytes([
+        ["סניף", "עיר", "אחראי"],
+        ["א", "לוד", "דנה"],
+        ["ב", 'ראשל"צ', "ניקיטה"],
+    ])
+    with patch.object(gmail_tools, "_gmail_service", return_value=_service_serving(raw)):
+        result = gmail_tools.search_email_attachment(
+            "m1", "Z8", "לוד, ראשון לציון", must_also_match="איתי, ניקיטה"
+        )
+    assert "ניקיטה" in result
+    assert "דנה" not in result, "the AND group did not filter"
+
+
+def test_search_attachment_reports_a_bad_filename_like_reading_does():
+    raw = _xlsx_bytes([["ערך"]])
+    with patch.object(gmail_tools, "_gmail_service", return_value=_service_serving(raw)):
+        result = gmail_tools.search_email_attachment("m1", "לא-קיים.xlsx", "רמלה")
+    assert result.startswith("❌") and "לא נמצא קובץ" in result
+
+
+def test_search_attachment_returns_an_error_string_instead_of_raising():
+    with patch.object(gmail_tools, "_gmail_service", side_effect=RuntimeError("boom")):
+        result = gmail_tools.search_email_attachment("m1", "f.xlsx", "רמלה")
+    assert result.startswith("❌")
+
+
+def test_reading_a_later_part_asks_for_that_part():
+    rows = [[f"שורה {i}", "טקסט ארוך כדי לדחוף את הקובץ מעבר לעמוד אחד" * 3]
+            for i in range(400)]
+    raw = _xlsx_bytes(rows)
+    with patch.object(gmail_tools, "_gmail_service", return_value=_service_serving(raw)):
+        first = gmail_tools.read_email_attachment("m1", "Z8", part=1)
+        second = gmail_tools.read_email_attachment("m1", "Z8", part=2)
+    assert "חלק 1 מתוך" in first
+    assert "חלק 2 מתוך" in second
+    assert first != second
+
+
+def test_search_is_still_read_only():
+    """search_email_attachment added a second Gmail read path; the guarantee that
+    nothing in this module can send mail has to survive every such addition."""
+    source = ast.parse(open("gmail_tools.py", encoding="utf-8").read())
+    called = {
+        node.func.attr for node in ast.walk(source)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "send" not in called

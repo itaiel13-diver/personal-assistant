@@ -213,50 +213,109 @@ def create_email_draft(to: str, subject: str, body: str) -> str:
         return f"❌ שגיאה ביצירת הטיוטה: {e}"
 
 
-def read_email_attachment(message_id: str, filename: str) -> str:
+def _locate_attachment(message_id: str, filename: str):
+    """Returns (target, raw_bytes, error). Exactly one of target/error is None."""
+    service = _gmail_service()
+    msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    attachments = _list_attachments(msg.get("payload", {}))
+    if not attachments:
+        return None, None, "❌ אין קבצים מצורפים במייל הזה."
+
+    # Matched by name rather than by attachmentId on purpose: the id is a
+    # long opaque string that a model transcribes wrongly, while the filename
+    # is short, meaningful, and already in front of it from read_email.
+    wanted = filename.strip().lower()
+    matches = [a for a in attachments if a["filename"].lower() == wanted]
+    if not matches:
+        matches = [a for a in attachments if wanted in a["filename"].lower()]
+    if not matches:
+        names = ", ".join(a["filename"] for a in attachments)
+        return None, None, f"❌ לא נמצא קובץ בשם '{filename}'. הקבצים במייל הזה: {names}"
+    if len(matches) > 1:
+        names = ", ".join(a["filename"] for a in matches)
+        return None, None, f"❌ יותר מקובץ אחד מתאים ל-'{filename}': {names}. צריך שם מדויק יותר."
+
+    target = matches[0]
+    if not attachment_readers.is_supported(target["filename"], target["mime_type"]):
+        # Checked before downloading - no point spending the round trip on
+        # bytes that cannot be turned into text anyway.
+        return None, None, attachment_readers.extract_text(
+            target["filename"], b"\x00", target["mime_type"]
+        )
+    if target["size"] > attachment_readers.MAX_ATTACHMENT_BYTES:
+        size_mb = target["size"] / (1024 * 1024)
+        return None, None, f"❌ הקובץ {target['filename']} גדול מדי לקריאה ({size_mb:.1f}MB)."
+
+    blob = service.users().messages().attachments().get(
+        userId="me", messageId=message_id, id=target["attachment_id"]
+    ).execute()
+    raw = base64.urlsafe_b64decode(blob["data"].encode("utf-8"))
+    return target, raw, None
+
+
+def read_email_attachment(message_id: str, filename: str, part: int = 1) -> str:
     """Reads the contents of a file attached to an email and returns it as text.
     message_id comes from search_emails, filename from the attachment list that
     read_email prints. Use this whenever Itai asks what is inside an attached
     file, or asks a question that the attached spreadsheet or document answers.
+    A long file is returned in numbered parts: the reply says how many there are,
+    and part=2, part=3 and so on fetch the rest, so nothing is unreachable. When
+    Itai is looking for specific rows rather than the whole file, prefer
+    search_email_attachment - it scans every row without paging.
     Supports xlsx, csv, pdf, docx and plain text. Images and scanned PDFs cannot
     be read - say so plainly rather than guessing at their contents."""
-    logger.info(f"Gmail tool: read_email_attachment(message_id={message_id!r}, filename={filename!r})")
+    logger.info(
+        f"Gmail tool: read_email_attachment(message_id={message_id!r}, "
+        f"filename={filename!r}, part={part!r})"
+    )
     try:
-        service = _gmail_service()
-        msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
-        attachments = _list_attachments(msg.get("payload", {}))
-        if not attachments:
-            return "❌ אין קבצים מצורפים במייל הזה."
-
-        # Matched by name rather than by attachmentId on purpose: the id is a
-        # long opaque string that a model transcribes wrongly, while the filename
-        # is short, meaningful, and already in front of it from read_email.
-        wanted = filename.strip().lower()
-        matches = [a for a in attachments if a["filename"].lower() == wanted]
-        if not matches:
-            matches = [a for a in attachments if wanted in a["filename"].lower()]
-        if not matches:
-            names = ", ".join(a["filename"] for a in attachments)
-            return f"❌ לא נמצא קובץ בשם '{filename}'. הקבצים במייל הזה: {names}"
-        if len(matches) > 1:
-            names = ", ".join(a["filename"] for a in matches)
-            return f"❌ יותר מקובץ אחד מתאים ל-'{filename}': {names}. צריך שם מדויק יותר."
-
-        target = matches[0]
-        if not attachment_readers.is_supported(target["filename"], target["mime_type"]):
-            # Checked before downloading - no point spending the round trip on
-            # bytes that cannot be turned into text anyway.
-            return attachment_readers.extract_text(target["filename"], b"\x00", target["mime_type"])
-        if target["size"] > attachment_readers.MAX_ATTACHMENT_BYTES:
-            size_mb = target["size"] / (1024 * 1024)
-            return f"❌ הקובץ {target['filename']} גדול מדי לקריאה ({size_mb:.1f}MB)."
-
-        blob = service.users().messages().attachments().get(
-            userId="me", messageId=message_id, id=target["attachment_id"]
-        ).execute()
-        raw = base64.urlsafe_b64decode(blob["data"].encode("utf-8"))
-        text = attachment_readers.extract_text(target["filename"], raw, target["mime_type"])
+        target, raw, error = _locate_attachment(message_id, filename)
+        if error:
+            return error
+        try:
+            page = int(part)
+        except (TypeError, ValueError):
+            page = 1
+        text = attachment_readers.extract_text(
+            target["filename"], raw, target["mime_type"], part=max(1, page)
+        )
         return f"📎 תוכן הקובץ {target['filename']}:\n\n{text}"
     except Exception as e:
         logger.error(f"Gmail attachment read failed: {e}")
         return f"❌ שגיאה בקריאת הקובץ המצורף: {e}"
+
+
+def search_email_attachment(message_id: str, filename: str, keywords: str,
+                            must_also_match: str = "") -> str:
+    """Searches inside an attached file and returns every row that matches, having
+    scanned the whole file with no row limit. Use this instead of
+    read_email_attachment whenever Itai wants particular rows rather than the
+    whole document - for example rows about a branch or city, or rows assigned to
+    a specific person.
+
+    keywords is a comma-separated list matched with OR: a row is a hit if it
+    contains ANY of them. Hebrew and English spellings of the cities in Itai's
+    territory are expanded automatically, so passing 'ראשון לציון' also finds
+    'ראשל"צ' and 'Rishon LeZion', and spelling differences like קריית/קרית do not
+    matter.
+
+    must_also_match is a second comma-separated list, ANDed with the first: a row
+    must match one keyword AND one of these. Use it to cross-reference - for
+    example keywords='רמלה, לוד, יבנה' with must_also_match='איתי, ניקיטה'
+    returns only the rows for those cities that also name one of those two
+    people. Leave it empty when no cross-reference is wanted."""
+    logger.info(
+        f"Gmail tool: search_email_attachment(message_id={message_id!r}, "
+        f"filename={filename!r}, keywords={keywords!r}, must_also_match={must_also_match!r})"
+    )
+    try:
+        target, raw, error = _locate_attachment(message_id, filename)
+        if error:
+            return error
+        return attachment_readers.search(
+            target["filename"], raw, keywords,
+            must_also_match=must_also_match, mime_type=target["mime_type"],
+        )
+    except Exception as e:
+        logger.error(f"Gmail attachment search failed: {e}")
+        return f"❌ שגיאה בחיפוש בקובץ המצורף: {e}"

@@ -25,9 +25,32 @@ The two halves are not equally available, measured against the live API on
                                  and not a bug.
 
 Routing a search engine through url_context does not get round it - DuckDuckGo
-and Bing result pages are both refused by the fetcher. So search_web says
-plainly that it needs the paid plan rather than inventing an answer, which is
-the one failure mode that would actually mislead Itai.
+and Bing result pages are both refused by the fetcher.
+
+So search_web now prefers a dedicated search API over Gemini grounding, and
+Tavily is the one it takes. That choice came out of a survey on 2026-09-06 of
+what a free tier actually still buys:
+
+  Google Custom Search JSON API   closed to new customers, shuts down 2027-01-01.
+  Bing Web Search API             deprecated 2025-08-11.
+  Brave Search API                free tier withdrawn; a card is required to sign up.
+  Serper                          2,500 credits once, not monthly - it runs out.
+  ddgs (DuckDuckGo)               no key at all, but unofficial scraping: it has
+                                  been fingerprint-blocked since 2026-08 and
+                                  breaks whenever the site changes. Not a
+                                  foundation for something Itai relies on.
+  Exa                             20,000 requests/month free, no card, but it is
+                                  semantic "find me similar pages" search, which
+                                  is the wrong shape for "when is the game".
+  Tavily                          1,000 credits/month free, indefinitely, no card,
+                                  built to answer an agent's question directly.
+
+Tavily wins on fit rather than on volume. It returns a written answer plus the
+pages behind it, which is exactly the shape this module already hands back, and
+1,000 lookups a month is far past what one person asks over WhatsApp.
+
+Gemini grounding is kept as the path when no Tavily key is configured, so the
+assistant degrades to the honest refusal instead of to silence.
 """
 import logging
 import os
@@ -53,6 +76,11 @@ WEB_MODEL_NAME = (
 # prompt for the rest of the conversation.
 MAX_ANSWER_CHARS = 4000
 MAX_SOURCES = 5
+
+# Set this and search_web works on the free tier. Leave it unset and search_web
+# falls back to Gemini grounding, which answers with its own refusal.
+TAVILY_URL = "https://api.tavily.com/search"
+TAVILY_TIMEOUT_SECONDS = 20
 
 _client = None
 
@@ -99,6 +127,81 @@ def _sources(response) -> list:
     except Exception as e:
         logger.warning(f"Could not read grounding sources: {e}")
     return found[:MAX_SOURCES]
+
+
+def _tavily_search(query: str) -> str:
+    """Asks Tavily and returns the answer with the pages behind it.
+
+    Tavily answers the question itself and hands back the sources it used, so
+    there is no second Gemini call on this path - the result goes straight back
+    as the function result. That makes it both cheaper and faster than grounding
+    would have been even if grounding were available.
+
+    The key is sent two ways on purpose. The Authorization header is the current
+    documented form and api_key in the body is the older one, and this could not
+    be checked live: api.tavily.com is unreachable from the sandbox this was
+    written in, so a wrong auth shape would have surfaced as a 401 on the very
+    first real question Itai asked. Sending both costs nothing and cannot be
+    wrong in either direction.
+    """
+    import requests
+
+    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    response = requests.post(
+        TAVILY_URL,
+        timeout=TAVILY_TIMEOUT_SECONDS,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "query": query,
+            "api_key": api_key,
+            "search_depth": "basic",  # 1 credit; "advanced" costs 2 and digs deeper.
+            "include_answer": True,
+            "max_results": MAX_SOURCES,
+        },
+    )
+
+    if response.status_code == 401:
+        return (
+            "מפתח החיפוש (TAVILY_API_KEY) לא תקין. תגיד לאיתי לבדוק אותו "
+            "בהגדרות של Render."
+        )
+    if response.status_code in (429, 432, 433):
+        # Tavily signals an exhausted plan with its own codes as well as 429.
+        return (
+            "נגמרה מכסת החיפושים החודשית (1,000 חינם בחודש). היא מתאפסת בתחילת "
+            "החודש הבא. אם יש לך קישור מסוים אני כן יכול לפתוח אותו."
+        )
+    response.raise_for_status()
+    data = response.json()
+
+    answer = (data.get("answer") or "").strip()
+    results = data.get("results") or []
+
+    if not answer:
+        # include_answer is honoured on every plan, but a query with nothing
+        # behind it comes back with results and no summary. The snippets are
+        # still a real answer, so hand those over rather than reporting failure.
+        snippets = []
+        for item in results[:3]:
+            text = (item.get("content") or "").strip()
+            if text:
+                snippets.append(text)
+        answer = "\n\n".join(snippets)
+
+    if not answer:
+        return f"לא מצאתי תשובה על '{query}'. נסה לנסח אחרת."
+
+    if len(answer) > MAX_ANSWER_CHARS:
+        answer = answer[:MAX_ANSWER_CHARS].rsplit("\n", 1)[0] + "\n[קוצר]"
+
+    sources = []
+    for item in results:
+        label = (item.get("title") or item.get("url") or "").strip()
+        if label and label not in sources:
+            sources.append(label)
+    if sources:
+        answer += "\n\nמקורות: " + " · ".join(sources[:MAX_SOURCES])
+    return answer
 
 
 def _ask(prompt: str, tool: types.Tool, label: str) -> str:
@@ -155,16 +258,26 @@ def search_web(query: str) -> str:
     if not query:
         return "צריך שאלה לחיפוש."
     logger.info(f"Web tool: search_web(query={query!r})")
+
+    if os.environ.get("TAVILY_API_KEY", "").strip():
+        try:
+            return _tavily_search(query)
+        except Exception as e:
+            logger.error(f"Tavily search failed for {query!r}: {e}")
+            # Deliberately not falling through to Gemini grounding here. That
+            # path is known to 429 on this key, so it would add several seconds
+            # of waiting before producing a worse answer than saying what broke.
+            return f"החיפוש באינטרנט נכשל: {e}"
+
     try:
         return _ask(query, types.Tool(google_search=types.GoogleSearch()), f"'{query}'")
     except Exception as e:
         logger.error(f"search_web failed for {query!r}: {e}")
         if _is_quota_error(e):
             return (
-                "חיפוש חי באינטרנט לא זמין כרגע: הוא דורש את התוכנית בתשלום של "
-                "Gemini, והמפתח הנוכחי בתוכנית החינמית. אם יש לך קישור מסוים "
-                "אני כן יכול לפתוח אותו ולקרוא אותו. תגיד לאיתי שזו החלטה של "
-                "עלות, לא תקלה."
+                "חיפוש חי באינטרנט לא מוגדר. הדרך של Gemini דורשת תוכנית בתשלום, "
+                "אבל יש חלופה חינמית: מפתח של Tavily ב-TAVILY_API_KEY. עד אז — אם "
+                "יש לך קישור מסוים אני כן יכול לפתוח אותו ולקרוא אותו."
             )
         return f"החיפוש באינטרנט נכשל: {e}"
 

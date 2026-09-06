@@ -31,6 +31,14 @@ def _response(text, sources=()):
     return pytypes.SimpleNamespace(text=text, candidates=[candidate])
 
 
+@pytest.fixture(autouse=True)
+def no_search_key(monkeypatch):
+    """Most tests here exercise the Gemini fallback, which only runs when no
+    Tavily key is set. Without this the suite would pass or fail depending on
+    whether the machine running it happens to have a key in its environment."""
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+
 @pytest.fixture
 def captured(monkeypatch):
     """Replaces the Gemini call, recording what it was asked."""
@@ -147,12 +155,184 @@ def test_the_web_model_follows_the_conversation_model(monkeypatch):
     importlib.reload(web_tools)
 
 
+def _web_tools_source():
+    return open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "web_tools.py"), encoding="utf-8").read()
+
+
 def test_the_web_module_cannot_send_anything():
-    # The same guarantee the mail tools carry: this module reads, and that is all.
+    """The same guarantee the mail tools carry: this module reads, and that is all.
+
+    It used to be enforced by forbidding an HTTP POST outright, which stopped
+    being possible the day search moved to Tavily - a search request is a POST.
+    So the rule is now about where the POST goes rather than whether one exists:
+    the one destination is the search endpoint, and nothing here may address
+    Itai's mailbox or WhatsApp. Dropping the test to make Tavily fit would have
+    quietly retired the guarantee instead of restating it.
+    """
     import ast
-    tree = ast.parse(open(os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "web_tools.py"), encoding="utf-8").read())
+
+    source = _web_tools_source()
+    tree = ast.parse(source)
     called = {node.func.attr for node in ast.walk(tree)
               if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
     assert "send" not in called
-    assert "post" not in called
+
+    posts = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute)
+             and node.func.attr == "post"]
+    for node in posts:
+        target = node.args[0] if node.args else None
+        assert isinstance(target, ast.Name) and target.id == "TAVILY_URL", (
+            "web_tools may only POST to the search endpoint"
+        )
+
+    for forbidden in ("graph.facebook.com", "gmail", "googleapis.com/gmail", "messages"):
+        assert forbidden not in source.lower(), f"web_tools must not reference {forbidden}"
+
+
+def test_the_only_address_this_module_posts_to_is_the_search_api():
+    assert web_tools.TAVILY_URL == "https://api.tavily.com/search"
+
+
+# --- Tavily, the free search backend -------------------------------------
+
+
+class _FakeHTTP:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+@pytest.fixture
+def tavily(monkeypatch):
+    """Turns the Tavily path on and captures the request instead of sending it.
+
+    Set .payload / .status before calling search_web to shape the reply.
+    """
+    import requests
+
+    state = pytypes.SimpleNamespace(sent=[], payload={"answer": "תשובה", "results": []}, status=200)
+
+    def fake_post(url, **kwargs):
+        state.sent.append({"url": url, **kwargs})
+        return _FakeHTTP(state.payload, state.status)
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setattr(requests, "post", fake_post)
+    return state
+
+
+def test_a_configured_key_is_used_instead_of_gemini_grounding(tavily, monkeypatch):
+    def must_not_run(*a, **k):
+        raise AssertionError("Gemini grounding was called even though Tavily is configured")
+
+    monkeypatch.setattr(web_tools, "_ask", must_not_run)
+    assert web_tools.search_web("מזג האוויר מחר") == "תשובה"
+    assert tavily.sent[0]["url"] == web_tools.TAVILY_URL
+    assert tavily.sent[0]["json"]["query"] == "מזג האוויר מחר"
+
+
+def test_the_key_travels_in_the_header_and_in_the_body(tavily):
+    web_tools.search_web("שאלה")
+    sent = tavily.sent[0]
+    assert sent["headers"]["Authorization"] == "Bearer tvly-test-key"
+    assert sent["json"]["api_key"] == "tvly-test-key"
+
+
+def test_the_answer_comes_back_with_the_pages_behind_it(tavily):
+    tavily.payload = {
+        "answer": "המשחק ביום שבת",
+        "results": [
+            {"title": "אתר הפועל", "url": "https://a.example"},
+            {"title": "ONE", "url": "https://b.example"},
+        ],
+    }
+    out = web_tools.search_web("מתי המשחק")
+    assert "המשחק ביום שבת" in out
+    assert "אתר הפועל" in out and "ONE" in out
+
+
+def test_a_source_listed_twice_appears_once(tavily):
+    tavily.payload = {
+        "answer": "כן",
+        "results": [
+            {"title": "ynet", "url": "https://ynet.co.il/1"},
+            {"title": "ynet", "url": "https://ynet.co.il/2"},
+        ],
+    }
+    assert web_tools.search_web("שאלה").count("ynet") == 1
+
+
+def test_a_result_without_a_title_falls_back_to_its_url(tavily):
+    tavily.payload = {"answer": "כן", "results": [{"url": "https://example.com/x"}]}
+    assert "https://example.com/x" in web_tools.search_web("שאלה")
+
+
+def test_snippets_stand_in_when_tavily_returns_no_summary(tavily):
+    tavily.payload = {
+        "answer": "",
+        "results": [{"title": "מקור", "url": "https://x.example", "content": "פרט חשוב"}],
+    }
+    assert "פרט חשוב" in web_tools.search_web("שאלה")
+
+
+def test_nothing_found_says_so_rather_than_returning_an_empty_message(tavily):
+    tavily.payload = {"answer": "", "results": []}
+    out = web_tools.search_web("שאלה בלי תשובה")
+    assert "לא מצאתי" in out
+
+
+def test_a_long_answer_is_capped_before_it_reaches_whatsapp(tavily):
+    tavily.payload = {"answer": "\n".join(["שורה"] * 5000), "results": []}
+    out = web_tools.search_web("שאלה")
+    assert len(out) <= web_tools.MAX_ANSWER_CHARS + 100
+    assert "[קוצר]" in out
+
+
+def test_a_rejected_key_is_explained_instead_of_raising(tavily):
+    tavily.status = 401
+    out = web_tools.search_web("שאלה")
+    assert "TAVILY_API_KEY" in out
+    assert "401" not in out
+
+
+def test_an_exhausted_quota_says_when_it_comes_back(tavily):
+    tavily.status = 429
+    out = web_tools.search_web("שאלה")
+    assert "מכסת" in out and "חודש" in out
+
+
+def test_a_network_failure_does_not_retry_the_path_known_to_be_blocked(tavily, monkeypatch):
+    import requests
+
+    def boom(*a, **k):
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(requests, "post", boom)
+    monkeypatch.setattr(
+        web_tools,
+        "_ask",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fell back to Gemini grounding")),
+    )
+    assert "נכשל" in web_tools.search_web("שאלה")
+
+
+def test_without_a_key_the_refusal_names_the_free_alternative(monkeypatch):
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    def quota_exhausted(*a, **k):
+        raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+    monkeypatch.setattr(web_tools, "_ask", quota_exhausted)
+    out = web_tools.search_web("שאלה")
+    assert "Tavily" in out
+    assert "429" not in out and "RESOURCE_EXHAUSTED" not in out

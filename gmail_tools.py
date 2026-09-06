@@ -91,6 +91,10 @@ def search_emails(query: str = "is:unread", max_results: int = 10) -> str:
     query uses Gmail's own search syntax, for example 'is:unread',
     'from:samsung', 'newer_than:3d', 'subject:יעדים'.
     Use read_email with an id from this list to see the full text of one."""
+    # Logged because the only record of a tool actually firing in production is the
+    # server log, and a successful Gmail call is otherwise indistinguishable from
+    # the model answering about mail without ever looking.
+    logger.info(f"Gmail tool: search_emails(query={query!r}, max_results={max_results})")
     try:
         service = _gmail_service()
         listing = service.users().messages().list(
@@ -119,6 +123,7 @@ def search_emails(query: str = "is:unread", max_results: int = 10) -> str:
 def read_email(message_id: str) -> str:
     """Returns the full text of one email. Get message_id from search_emails,
     which prints it as [id:...] after each result."""
+    logger.info(f"Gmail tool: read_email(message_id={message_id!r})")
     try:
         service = _gmail_service()
         msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
@@ -141,6 +146,7 @@ def create_email_draft(to: str, subject: str, body: str) -> str:
     NOT sent - this function only ever creates drafts. Tell Itai the draft is ready
     and that he needs to open Gmail to review and send it himself.
     Use this whenever Itai asks you to write or reply to an email."""
+    logger.info(f"Gmail tool: create_email_draft(to={to!r}, subject={subject!r})")
     try:
         service = _gmail_service()
         message = EmailMessage()

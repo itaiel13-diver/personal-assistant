@@ -4,3 +4,6 @@ psycopg[binary]
 flask
 requests
 gunicorn
+openpyxl
+pypdf
+python-docx

@@ -9,7 +9,12 @@ from google.genai import types
 from google.genai import errors as genai_errors
 
 import storage
-from gmail_tools import create_email_draft, read_email, search_emails
+from gmail_tools import (
+    create_email_draft,
+    read_email,
+    read_email_attachment,
+    search_emails,
+)
 from calendar_tools import (
     ISRAEL_TZ,
     create_calendar_event,
@@ -139,6 +144,7 @@ tools_list = [
     delete_calendar_event,
     search_emails,
     read_email,
+    read_email_attachment,
     create_email_draft,
 ]
 

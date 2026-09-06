@@ -3,6 +3,8 @@ import logging
 import os
 from email.message import EmailMessage
 
+import attachment_readers
+
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
@@ -85,6 +87,41 @@ def _extract_body(payload: dict) -> str:
     return ""
 
 
+def _list_attachments(payload: dict) -> list:
+    """Collects every attached file in the message.
+
+    Attachment parts are the ones carrying a filename. Unlike a text part they
+    hold no `data`: the body is a reference (`attachmentId`) that has to be
+    fetched in a second, separate API call. That is why simply walking the tree
+    for text - which is all _extract_body does - skips them without a trace."""
+    found = []
+    if not payload:
+        return found
+    filename = payload.get("filename") or ""
+    body = payload.get("body", {}) or {}
+    if filename and body.get("attachmentId"):
+        found.append({
+            "filename": filename,
+            "mime_type": payload.get("mimeType", ""),
+            "size": body.get("size", 0),
+            "attachment_id": body["attachmentId"],
+        })
+    for part in payload.get("parts", []) or []:
+        found.extend(_list_attachments(part))
+    return found
+
+
+def _describe_attachments(attachments: list) -> str:
+    lines = []
+    for a in attachments:
+        supported = (
+            " — ניתן לקריאה" if attachment_readers.is_supported(a["filename"], a["mime_type"])
+            else " — לא ניתן לקריאה"
+        )
+        lines.append(f"  • {a['filename']} ({a['size'] // 1024 or 1}KB){supported}")
+    return "\n".join(lines)
+
+
 def search_emails(query: str = "is:unread", max_results: int = 10) -> str:
     """Searches Itai's work inbox and returns matching emails as a list of
     sender / date / subject lines, each ending with [id:...].
@@ -127,15 +164,25 @@ def read_email(message_id: str) -> str:
     try:
         service = _gmail_service()
         msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
-        body = _extract_body(msg.get("payload", {}))
+        payload = msg.get("payload", {})
+        body = _extract_body(payload)
         # Long threads blow up the prompt and the cost; the model can ask for more.
         if len(body) > 4000:
             body = body[:4000] + "\n[...הודעה ארוכה, נחתכה]"
-        return (
+
+        result = (
             f"מאת: {_header(msg, 'From')}\n"
             f"תאריך: {_header(msg, 'Date')}\n"
             f"נושא: {_header(msg, 'Subject')}\n\n{body}"
         )
+        attachments = _list_attachments(payload)
+        if attachments:
+            result += (
+                f"\n\n📎 קבצים מצורפים ({len(attachments)}):\n"
+                + _describe_attachments(attachments)
+                + "\n\nכדי לקרוא אחד מהם, קרא ל-read_email_attachment עם שם הקובץ."
+            )
+        return result
     except Exception as e:
         logger.error(f"Gmail read failed: {e}")
         return f"❌ שגיאה בקריאת המייל: {e}"
@@ -164,3 +211,52 @@ def create_email_draft(to: str, subject: str, body: str) -> str:
     except Exception as e:
         logger.error(f"Gmail draft failed: {e}")
         return f"❌ שגיאה ביצירת הטיוטה: {e}"
+
+
+def read_email_attachment(message_id: str, filename: str) -> str:
+    """Reads the contents of a file attached to an email and returns it as text.
+    message_id comes from search_emails, filename from the attachment list that
+    read_email prints. Use this whenever Itai asks what is inside an attached
+    file, or asks a question that the attached spreadsheet or document answers.
+    Supports xlsx, csv, pdf, docx and plain text. Images and scanned PDFs cannot
+    be read - say so plainly rather than guessing at their contents."""
+    logger.info(f"Gmail tool: read_email_attachment(message_id={message_id!r}, filename={filename!r})")
+    try:
+        service = _gmail_service()
+        msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+        attachments = _list_attachments(msg.get("payload", {}))
+        if not attachments:
+            return "❌ אין קבצים מצורפים במייל הזה."
+
+        # Matched by name rather than by attachmentId on purpose: the id is a
+        # long opaque string that a model transcribes wrongly, while the filename
+        # is short, meaningful, and already in front of it from read_email.
+        wanted = filename.strip().lower()
+        matches = [a for a in attachments if a["filename"].lower() == wanted]
+        if not matches:
+            matches = [a for a in attachments if wanted in a["filename"].lower()]
+        if not matches:
+            names = ", ".join(a["filename"] for a in attachments)
+            return f"❌ לא נמצא קובץ בשם '{filename}'. הקבצים במייל הזה: {names}"
+        if len(matches) > 1:
+            names = ", ".join(a["filename"] for a in matches)
+            return f"❌ יותר מקובץ אחד מתאים ל-'{filename}': {names}. צריך שם מדויק יותר."
+
+        target = matches[0]
+        if not attachment_readers.is_supported(target["filename"], target["mime_type"]):
+            # Checked before downloading - no point spending the round trip on
+            # bytes that cannot be turned into text anyway.
+            return attachment_readers.extract_text(target["filename"], b"\x00", target["mime_type"])
+        if target["size"] > attachment_readers.MAX_ATTACHMENT_BYTES:
+            size_mb = target["size"] / (1024 * 1024)
+            return f"❌ הקובץ {target['filename']} גדול מדי לקריאה ({size_mb:.1f}MB)."
+
+        blob = service.users().messages().attachments().get(
+            userId="me", messageId=message_id, id=target["attachment_id"]
+        ).execute()
+        raw = base64.urlsafe_b64decode(blob["data"].encode("utf-8"))
+        text = attachment_readers.extract_text(target["filename"], raw, target["mime_type"])
+        return f"📎 תוכן הקובץ {target['filename']}:\n\n{text}"
+    except Exception as e:
+        logger.error(f"Gmail attachment read failed: {e}")
+        return f"❌ שגיאה בקריאת הקובץ המצורף: {e}"

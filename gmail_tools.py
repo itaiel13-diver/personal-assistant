@@ -8,9 +8,18 @@ from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
-# readonly + compose only. compose can create and update drafts but CANNOT send,
-# so the assistant is physically incapable of emailing anyone by mistake - the
-# safety rule in the system prompt is enforced by the token, not by good behaviour.
+# readonly + compose.
+#
+# IMPORTANT, and verified the hard way against the live API: gmail.compose DOES
+# allow sending - drafts().send() succeeds with this scope. An earlier version of
+# this comment claimed the opposite and it was wrong. There is no Gmail scope that
+# grants draft creation without also granting the ability to send.
+#
+# So the "never send by itself" guarantee does NOT come from the token. It comes
+# from this module exposing no sending function at all: the assistant is given
+# create_email_draft and nothing else, and drafts().send() is never called
+# anywhere in this codebase. Adding such a call would silently remove the only
+# thing standing between the model and a real outgoing email.
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
@@ -128,9 +137,9 @@ def read_email(message_id: str) -> str:
 
 
 def create_email_draft(to: str, subject: str, body: str) -> str:
-    """Creates a DRAFT email in Itai's Gmail. It is only saved to his drafts folder -
-    this cannot and will not send anything. Tell Itai the draft is ready and that he
-    needs to open Gmail to review and send it himself.
+    """Creates a DRAFT email in Itai's Gmail. It is saved to his drafts folder and is
+    NOT sent - this function only ever creates drafts. Tell Itai the draft is ready
+    and that he needs to open Gmail to review and send it himself.
     Use this whenever Itai asks you to write or reply to an email."""
     try:
         service = _gmail_service()

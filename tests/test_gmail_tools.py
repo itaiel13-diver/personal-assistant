@@ -1,3 +1,4 @@
+import ast
 import base64
 from unittest.mock import MagicMock, patch
 
@@ -8,11 +9,32 @@ def _b64(text: str) -> str:
     return base64.urlsafe_b64encode(text.encode("utf-8")).decode()
 
 
-def test_scopes_cannot_send_mail():
-    """The whole safety design rests on this: compose creates drafts, send sends.
-    If a send scope ever appears here, the assistant can email people by itself."""
-    assert not any("gmail.send" in s or "mail.google.com" in s for s in gmail_tools.SCOPES)
-    assert any(s.endswith("gmail.compose") for s in gmail_tools.SCOPES)
+def test_module_exposes_no_way_to_send_mail():
+    """gmail.compose DOES permit sending - verified against the live API, where
+    drafts().send() succeeded and actually delivered a message. So the guarantee
+    that the assistant never sends mail rests entirely on this module offering no
+    sending function and never calling drafts().send() or messages().send().
+    If that ever changes, this test is the thing that should stop it."""
+    # Parsed rather than grepped, so comments and docstrings that merely discuss
+    # sending do not trip it - only a real call does.
+    tree = ast.parse(open(gmail_tools.__file__, encoding="utf-8").read())
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "send" not in called, "gmail_tools now calls send() somewhere"
+    public = [n for n in dir(gmail_tools) if not n.startswith("_") and callable(getattr(gmail_tools, n))]
+    assert not any("send" in n.lower() for n in public), f"a sending function is exposed: {public}"
+
+
+def test_scopes_are_limited_to_read_and_compose():
+    """Broader scopes (gmail.modify, full mail.google.com) would also allow
+    deleting mail and changing labels, which the assistant has no reason to do."""
+    assert sorted(gmail_tools.SCOPES) == sorted([
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.compose",
+    ])
 
 
 def test_extract_body_finds_plain_text_nested_in_multipart():

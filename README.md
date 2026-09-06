@@ -105,6 +105,24 @@ pytest -v
 - ל-Service Account יש יומן `primary` **משלו** (ריק). חייבים לציין `GOOGLE_CALENDAR_ID` מפורשות, אחרת קוראים יומן ריק.
 - `calendarList` של Service Account נשאר **ריק** גם אחרי שיתוף תקין — זה לא סימן לתקלה. גישה ישירה לפי מזהה היומן עובדת בכל זאת.
 
+## הגדרת Gmail
+
+**שונה מהיומן:** ל-Gmail אין מסלול Service Account עבור חשבון `@gmail.com` פרטי, ולכן נדרש אישור חד-פעמי בדפדפן (OAuth).
+
+1. **Google Cloud** → הפעל/י **Gmail API**
+2. **OAuth consent screen** → User Type: External → הוסף/י את כתובת חשבון העבודה כ-**Test user**
+3. **Credentials → Create Credentials → OAuth client ID → Desktop app** → מתקבלים Client ID ו-Client Secret
+4. הרצה חד-פעמית:
+   ```bash
+   GMAIL_CLIENT_ID=... GMAIL_CLIENT_SECRET=... python scripts/get_gmail_refresh_token.py
+   ```
+   נפתחת כתובת לאישור, ומתקבל `GMAIL_REFRESH_TOKEN`
+5. שלושת הערכים נכנסים כמשתני סביבה
+
+**מלכודת:** כל עוד אפליקציית ה-OAuth בסטטוס **"Testing"**, ה-refresh token **פג כל 7 ימים** וצריך לחזור על שלב 4. למעבר ל-"In production" ייתכן שתידרש בדיקת אימות של Google — התנאים המדויקים לא אומתו.
+
+**רמת הגישה מכוונת ומוגבלת:** `gmail.readonly` + `gmail.compose` בלבד. `compose` יוצר טיוטות אך **לא מסוגל לשלוח**. כלל הבטיחות ("אף פעם לא לשלוח לבד") נאכף כאן ברמת ההרשאה, לא בהסתמכות על התנהגות המודל.
+
 ## הערות אבטחה
 
 - מפתחות ה-API (`GEMINI_API_KEY`, `WHATSAPP_TOKEN`, `META_APP_SECRET`) נקראים אך ורק ממשתני סביבה — אין לשמור אותם בקוד, ו-`.env` מוגן ב-`.gitignore`.

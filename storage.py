@@ -11,6 +11,62 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 # roughly 20 exchanges - enough for a working day of context.
 MAX_HISTORY_ENTRIES = 40
 
+
+def _parts(entry) -> list:
+    """Stored entries are plain dicts (JSONB), but tolerate anything shaped oddly."""
+    if not isinstance(entry, dict):
+        return []
+    parts = entry.get("parts")
+    return parts if isinstance(parts, list) else []
+
+
+def _has(entry, *keys) -> bool:
+    return any(
+        isinstance(part, dict) and any(part.get(k) is not None for k in keys)
+        for part in _parts(entry)
+    )
+
+
+def _is_call(entry) -> bool:
+    return _has(entry, "function_call", "functionCall")
+
+
+def _is_response(entry) -> bool:
+    return _has(entry, "function_response", "functionResponse")
+
+
+def repair_history(history: list) -> list:
+    """Drops function-response turns that have no function call in front of them.
+
+    Gemini rejects the whole request with 400 INVALID_ARGUMENT if a function
+    response turn does not immediately follow a function call turn - and once
+    that history is stored, every later message replays it and fails too, so
+    the conversation is dead until the row is repaired. Trimming to the last N
+    entries is exactly what creates the orphan: the cut can land between a call
+    and its response, leaving the response at the head. A trailing call with no
+    response is the mirror image of the same problem and is dropped as well.
+    """
+    if not isinstance(history, list):
+        return []
+
+    clean = []
+    response_allowed = False
+    for entry in history:
+        if _is_response(entry):
+            if not response_allowed:
+                continue
+            clean.append(entry)
+            # A model turn may emit several calls answered over several turns.
+            continue
+        clean.append(entry)
+        response_allowed = _is_call(entry)
+
+    while clean and _is_call(clean[-1]) and not _is_response(clean[-1]):
+        clean.pop()
+
+    return clean
+
+
 _schema_ready = False
 
 
@@ -58,14 +114,16 @@ def load_history(sender_id: str) -> list:
             with conn.cursor() as cur:
                 cur.execute("SELECT history FROM conversations WHERE sender_id = %s", (sender_id,))
                 row = cur.fetchone()
-        return row[0] if row else []
+        # Repaired on the way out too, so a row already broken by an older trim
+        # heals itself on the next message instead of needing a manual edit.
+        return repair_history(row[0]) if row else []
     except Exception as e:
         logger.error(f"Failed to load history for {sender_id}: {e}")
         return []
 
 
 def save_history(sender_id: str, history: list) -> None:
-    trimmed = history[-MAX_HISTORY_ENTRIES:]
+    trimmed = repair_history(history[-MAX_HISTORY_ENTRIES:])
     try:
         with _connect() as conn:
             _ensure_schema(conn)

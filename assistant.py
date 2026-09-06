@@ -8,7 +8,13 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
-from calendar_tools import ISRAEL_TZ, create_calendar_event, get_calendar_events
+from calendar_tools import (
+    ISRAEL_TZ,
+    create_calendar_event,
+    delete_calendar_event,
+    get_calendar_events,
+    update_calendar_event,
+)
 
 # הגדרת הלוגים למעקב
 logging.basicConfig(level=logging.INFO)
@@ -124,6 +130,8 @@ tools_list = [
     update_daily_schedule,
     get_calendar_events,
     create_calendar_event,
+    update_calendar_event,
+    delete_calendar_event,
 ]
 
 

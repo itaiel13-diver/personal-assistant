@@ -35,16 +35,36 @@ def _is_response(entry) -> bool:
     return _has(entry, "function_response", "functionResponse")
 
 
-def repair_history(history: list) -> list:
-    """Drops function-response turns that have no function call in front of them.
+def _is_plain_user(entry) -> bool:
+    """A turn Itai actually typed - the only thing a conversation may open with,
+    and, alongside a function response, the only thing a call may follow."""
+    return (
+        isinstance(entry, dict)
+        and entry.get("role") == "user"
+        and not _is_response(entry)
+    )
 
-    Gemini rejects the whole request with 400 INVALID_ARGUMENT if a function
-    response turn does not immediately follow a function call turn - and once
-    that history is stored, every later message replays it and fails too, so
-    the conversation is dead until the row is repaired. Trimming to the last N
-    entries is exactly what creates the orphan: the cut can land between a call
-    and its response, leaving the response at the head. A trailing call with no
-    response is the mirror image of the same problem and is dropped as well.
+
+def repair_history(history: list) -> list:
+    """Enforces the two turn-ordering rules Gemini rejects a whole request over.
+
+    A function response must directly follow its call, and a call must directly
+    follow a real user turn or a function response. Break either and the API
+    returns 400 INVALID_ARGUMENT - and because the offending shape is what we
+    stored, every later message replays it and fails too. The conversation is
+    dead, not degraded.
+
+    Trimming to the last N entries is what creates both violations: the cut can
+    land between a call and its response, leaving the response orphaned at the
+    head - and dropping that orphan promotes the call behind it to the head,
+    where nothing precedes it at all. Fixing only the first half is what took
+    production down a second time on 2026-09-06, a few minutes after the first
+    fix deployed, so both rules are now enforced against the same walk.
+
+    Nothing is dropped that the API would have accepted: a conversation opening
+    on a model turn is fine, and only a call in a position the second rule
+    forbids is removed. Being stricter than the API would cost Itai the last
+    answer he was given, for no gain.
     """
     if not isinstance(history, list):
         return []
@@ -56,12 +76,19 @@ def repair_history(history: list) -> list:
             if not response_allowed:
                 continue
             clean.append(entry)
-            # A model turn may emit several calls answered over several turns.
+            # Deliberately leaves response_allowed set: one model turn may emit
+            # several calls, answered by several response turns in a row.
+            continue
+        if _is_call(entry):
+            if not clean or not (_is_plain_user(clean[-1]) or _is_response(clean[-1])):
+                continue
+            clean.append(entry)
+            response_allowed = True
             continue
         clean.append(entry)
-        response_allowed = _is_call(entry)
+        response_allowed = False
 
-    while clean and _is_call(clean[-1]) and not _is_response(clean[-1]):
+    while clean and _is_call(clean[-1]):
         clean.pop()
 
     return clean

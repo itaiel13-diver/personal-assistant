@@ -40,7 +40,7 @@ def test_a_response_that_follows_its_call_is_kept():
 def test_several_responses_to_one_call_turn_all_survive():
     # The model can emit parallel calls answered over more than one turn; only the
     # first response is adjacent to the call, and dropping the rest would lose data.
-    history = [_call("read_email"), _response("read_email"),
+    history = [_text("user", "מה יש במייל"), _call("read_email"), _response("read_email"),
                _response("read_email_attachment"), _text("model", "סיימתי")]
     assert storage.repair_history(history) == history
 
@@ -88,3 +88,43 @@ def test_camel_case_keys_are_recognised_too():
     broken = [{"role": "user", "parts": [{"functionResponse": {"name": "x", "response": {}}}]},
               _text("model", "ok")]
     assert storage.repair_history(broken) == [_text("model", "ok")]
+
+
+def test_a_call_with_nothing_in_front_of_it_is_dropped():
+    # The second production outage, 2026-09-06 18:36 UTC: dropping the orphaned
+    # response at the head promoted the call behind it to the head, and Gemini
+    # rejects that with the mirror-image 400 - "function call turn comes
+    # immediately after a user turn or after a function response turn".
+    broken = [_response("search_emails"), _call("search_emails"),
+              _response("search_emails"), _text("user", "היי"), _text("model", "שלום")]
+    assert storage.repair_history(broken) == [_text("user", "היי"), _text("model", "שלום")]
+
+
+def test_a_call_after_a_plain_model_turn_is_dropped():
+    history = [_text("user", "היי"), _text("model", "שלום"), _call("read_email"),
+               _response("read_email")]
+    assert storage.repair_history(history) == [_text("user", "היי"), _text("model", "שלום")]
+
+
+def test_a_conversation_may_still_open_on_a_model_turn():
+    # Stricter than the API would be a real cost: it throws away the last answer
+    # Itai was given. Only the call ordering rules are enforced, nothing more.
+    history = [_text("model", "שמרתי"), _text("user", "תודה")]
+    assert storage.repair_history(history) == history
+
+
+def test_trimming_never_leaves_a_call_the_api_would_reject():
+    # The companion to the response check below, over every possible cut point.
+    long_history = []
+    for i in range(60):
+        long_history.append(_text("user", f"הודעה {i}"))
+        long_history.append(_call("search_emails"))
+        long_history.append(_response("search_emails"))
+    for cut in range(1, len(long_history)):
+        repaired = storage.repair_history(long_history[-cut:])
+        for i, entry in enumerate(repaired):
+            if storage._is_call(entry):
+                assert i > 0, f"cut={cut}: history opens on a call"
+                before = repaired[i - 1]
+                assert storage._is_response(before) or not storage._is_call(before), \
+                    f"cut={cut}: call at {i} follows something the API rejects"

@@ -16,6 +16,10 @@ from gmail_tools import (
     search_email_attachment,
     search_emails,
 )
+from web_tools import (
+    read_web_page,
+    search_web,
+)
 from calendar_tools import (
     ISRAEL_TZ,
     create_calendar_event,
@@ -80,6 +84,20 @@ EMAIL ATTACHMENTS:
   them. Saying "the rest is hidden" is only correct if you have actually fetched every part.
 - Images, scanned PDFs and old .xls/.doc files cannot be read. Say so plainly and say what
   would fix it (re-saving as xlsx/docx) - never guess at contents you could not read.
+
+THE INTERNET:
+- search_web looks something up live; read_web_page opens one specific address.
+- Your training data has a cutoff and Itai has no idea where it falls. Anything that
+  can change - today's news, a price, a score, opening hours, whether a product still
+  exists, what a company is doing now - goes through a tool. Answering it from memory
+  produces something that sounds current and is not, which is the worst failure you
+  have available.
+- If he sends a link, open it with read_web_page rather than guessing from the address.
+- Live search may come back saying it is unavailable on the current plan. That is a
+  real answer, not an error to hide: tell him, and offer to open a specific link
+  instead. Do not quietly answer from memory in its place.
+- Never use these for his own mail, calendar or files - those have their own tools and
+  the web does not know about them.
 
 DATA EXTRACTION & FILE HANDLING RULES:
 1. Strict Context Filtering:
@@ -168,6 +186,8 @@ tools_list = [
     read_email_attachment,
     search_email_attachment,
     create_email_draft,
+    search_web,
+    read_web_page,
 ]
 
 

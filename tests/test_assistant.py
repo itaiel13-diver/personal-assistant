@@ -12,9 +12,9 @@ import assistant
 def isolate_state(tmp_path, monkeypatch):
     """Every test gets its own memory file and a clean session cache."""
     monkeypatch.setattr(assistant, "MEMORY_FILE", str(tmp_path / "long_term_memory.json"))
-    assistant._sessions.clear()
+    assistant._fallback_sessions.clear()
     yield
-    assistant._sessions.clear()
+    assistant._fallback_sessions.clear()
 
 
 def test_save_to_long_term_memory_persists_and_reports_success():
@@ -61,8 +61,8 @@ def test_get_session_is_rebuilt_when_the_date_changes(monkeypatch):
     assert fake_client.chats.create.call_count == 1
 
     # Simulate the clock rolling into the next day.
-    stale_chat, stale_date = assistant._sessions["sender-a"]
-    assistant._sessions["sender-a"] = (stale_chat, stale_date - timedelta(days=1))
+    stale_chat, stale_date = assistant._fallback_sessions["sender-a"]
+    assistant._fallback_sessions["sender-a"] = (stale_chat, stale_date - timedelta(days=1))
 
     assistant._get_session("sender-a")
     assert fake_client.chats.create.call_count == 2
@@ -76,6 +76,61 @@ def test_get_session_isolates_different_senders(monkeypatch):
     chat_a = assistant._get_session("sender-a")
     chat_b = assistant._get_session("sender-b")
     assert chat_a is not chat_b
+
+
+def test_history_is_loaded_from_storage_and_saved_back(monkeypatch):
+    """This is the whole point of the storage layer: a fresh process must pick the
+    conversation back up, and must write the new turns back for the next one."""
+    monkeypatch.setattr(assistant.storage, "enabled", lambda: True)
+    stored = [{"role": "user", "parts": [{"text": "שלום"}]}]
+    monkeypatch.setattr(assistant.storage, "load_history", lambda sid: stored)
+    saved = {}
+    monkeypatch.setattr(assistant.storage, "save_history", lambda sid, h: saved.update({sid: h}))
+
+    fake_chat = MagicMock()
+    fake_chat.send_message.return_value = MagicMock(text="תשובה")
+    fake_chat.get_history.return_value = [
+        assistant.types.Content(role="user", parts=[assistant.types.Part(text="שלום")]),
+        assistant.types.Content(role="model", parts=[assistant.types.Part(text="תשובה")]),
+    ]
+    fake_client = MagicMock()
+    fake_client.chats.create.return_value = fake_chat
+    monkeypatch.setattr(assistant, "client", fake_client)
+
+    assistant.handle_whatsapp_message("מה קורה", sender_id="sender-db")
+
+    # The stored history must be handed to the new chat...
+    passed_history = fake_client.chats.create.call_args.kwargs["history"]
+    assert len(passed_history) == 1
+    assert passed_history[0].parts[0].text == "שלום"
+    # ...and the updated history written back.
+    assert "sender-db" in saved
+    assert len(saved["sender-db"]) == 2
+
+
+def test_no_process_state_is_kept_when_storage_is_enabled(monkeypatch):
+    """With a database, nothing may be cached in process memory - that cache was
+    exactly what made the assistant amnesiac after the server slept."""
+    monkeypatch.setattr(assistant.storage, "enabled", lambda: True)
+    monkeypatch.setattr(assistant.storage, "load_history", lambda sid: [])
+    monkeypatch.setattr(assistant.storage, "save_history", lambda sid, h: None)
+    fake_client = MagicMock()
+    fake_client.chats.create.side_effect = lambda **kwargs: MagicMock()
+    monkeypatch.setattr(assistant, "client", fake_client)
+
+    assistant._get_session("sender-db")
+    assistant._get_session("sender-db")
+    assert assistant._fallback_sessions == {}
+    assert fake_client.chats.create.call_count == 2  # rebuilt from storage each time
+
+
+def test_one_corrupt_history_entry_does_not_lose_the_rest(monkeypatch):
+    restored = assistant._deserialise([
+        {"role": "user", "parts": [{"text": "טוב"}]},
+        {"role": "user", "parts": "this is not valid"},
+    ])
+    assert len(restored) == 1
+    assert restored[0].parts[0].text == "טוב"
 
 
 def test_send_with_retry_recovers_after_transient_errors(monkeypatch):
@@ -110,7 +165,7 @@ def test_handle_whatsapp_message_returns_hebrew_fallback_when_session_creation_f
 
     result = assistant.handle_whatsapp_message("test", sender_id="brand-new-sender")
     assert "תקלה זמנית" in result
-    assert "brand-new-sender" not in assistant._sessions  # no half-broken state left behind
+    assert "brand-new-sender" not in assistant._fallback_sessions  # no half-broken state left behind
 
 
 def test_handle_whatsapp_message_falls_back_when_response_has_no_text(monkeypatch):

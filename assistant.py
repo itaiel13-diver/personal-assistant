@@ -8,6 +8,7 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
+import storage
 from calendar_tools import (
     ISRAEL_TZ,
     create_calendar_event,
@@ -85,9 +86,15 @@ COMMUNICATION STYLE:
 # 3. הגדרת פונקציות ה-Tools (Function Calling)
 
 def save_to_long_term_memory(key: str, value: str, category: str = "general") -> str:
-    """Saves a new learned rule, store mapping, or preference into the long-term memory JSON file."""
-    memory_data = {}
+    """Saves a new learned rule, store mapping, or preference permanently."""
+    if storage.enabled():
+        try:
+            storage.save_memory(key, value, category)
+            return f"✅ הזיכרון עודכן בהצלחה: {key} = {value}"
+        except Exception as e:
+            return f"❌ שגיאה בשמירת הזיכרון: {str(e)}"
 
+    memory_data = {}
     if os.path.exists(MEMORY_FILE):
         try:
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
@@ -95,10 +102,7 @@ def save_to_long_term_memory(key: str, value: str, category: str = "general") ->
         except Exception as e:
             logger.error(f"Error reading memory file: {e}")
 
-    memory_data[key] = {
-        "value": value,
-        "category": category
-    }
+    memory_data[key] = {"value": value, "category": category}
 
     try:
         with open(MEMORY_FILE, "w", encoding="utf-8") as f:
@@ -136,12 +140,15 @@ tools_list = [
 
 
 def _load_memory_context() -> str:
-    """Renders long-term memory as extra system context, for injection when a session starts."""
-    if not os.path.exists(MEMORY_FILE):
-        return ""
+    """Renders long-term memory as extra system context, injected on every message."""
     try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            mem = json.load(f)
+        if storage.enabled():
+            mem = storage.load_memory()
+        elif os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                mem = json.load(f)
+        else:
+            return ""
         if not mem:
             return ""
         return f"\n\n[LONG TERM MEMORY]: {json.dumps(mem, ensure_ascii=False)}"
@@ -151,14 +158,12 @@ def _load_memory_context() -> str:
 
 
 # 4. שיחות מתמשכות לפי שולח
-# כל שולח (מספר וואטסאפ) מקבל אובייקט Chat אחד שנשמר לאורך חיי התהליך, כך
-# שהעוזר זוכר את מהלך השיחה הנוכחי ולא רק עובדות מהזיכרון ארוך-הטווח.
-# הערה: זה זיכרון בתוך-תהליך בלבד - הוא מתאפס בכל הפעלה מחדש של השרת
-# (למשל Render בטיר החינמי שנרדם אחרי חוסר פעילות).
-# הערך הוא (אובייקט השיחה, התאריך שבו נוצרה) - התאריך נשמר כי הוא מוזרק
-# ל-system instruction, וסשן ששרד חצות היה ממשיך לחשוב שהיום הוא אתמול
-# ולקבוע אירועים ביום הלא נכון.
-_sessions: dict[str, tuple] = {}
+# אין כאן מצב בזיכרון התהליך בכוונה. כל הודעה טוענת את היסטוריית השיחה
+# ממסד הנתונים, בונה ממנה שיחה חדשה, ושומרת את ההיסטוריה המעודכנת בחזרה.
+# זה מה שמאפשר לעוזר לזכור גם אחרי שהשרת נרדם, קרס או נפרס מחדש - התרחיש
+# שגרם לתחושה של "שיחה עם מישהו שלא זוכר כלום".
+# כשאין מסד נתונים מוגדר, המילון הזה משמש כגיבוי - והוא אכן נמחק בכל הפעלה מחדש.
+_fallback_sessions: dict[str, tuple] = {}
 
 
 def _retry_on_server_error(fn, attempts: int = 3):
@@ -186,19 +191,47 @@ def _date_context() -> str:
     return f"\n\n[CURRENT DATE AND TIME IN ISRAEL]: {now.strftime('%A, %d/%m/%Y, %H:%M')}"
 
 
+def _build_config() -> types.GenerateContentConfig:
+    """Rebuilt for every message so the date and the long-term memory are always
+    current, however old the stored conversation is."""
+    return types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT + _load_memory_context() + _date_context(),
+        tools=tools_list,
+    )
+
+
+def _serialise(history: list) -> list:
+    return [c.model_dump(mode="json", exclude_none=True) for c in history]
+
+
+def _deserialise(raw: list) -> list:
+    restored = []
+    for entry in raw:
+        try:
+            restored.append(types.Content(**entry))
+        except Exception as e:
+            # One malformed row must not lock the sender out of their whole history.
+            logger.error(f"Dropping unreadable history entry: {e}")
+    return restored
+
+
 def _get_session(sender_id: str):
+    """Returns a chat rehydrated from stored history. Without a database this
+    degrades to a per-process cache that a restart wipes."""
+    if storage.enabled():
+        history = _deserialise(storage.load_history(sender_id))
+        return _retry_on_server_error(lambda: client.chats.create(
+            model=MODEL_NAME, config=_build_config(), history=history
+        ))
+
     today = datetime.now(ISRAEL_TZ).date()
-    cached = _sessions.get(sender_id)
+    cached = _fallback_sessions.get(sender_id)
     if cached is None or cached[1] != today:
         chat = _retry_on_server_error(lambda: client.chats.create(
-            model=MODEL_NAME,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT + _load_memory_context() + _date_context(),
-                tools=tools_list,
-            ),
+            model=MODEL_NAME, config=_build_config()
         ))
-        _sessions[sender_id] = (chat, today)
-    return _sessions[sender_id][0]
+        _fallback_sessions[sender_id] = (chat, today)
+    return _fallback_sessions[sender_id][0]
 
 
 def _send_with_retry(chat, text: str, attempts: int = 3):
@@ -208,13 +241,15 @@ def _send_with_retry(chat, text: str, attempts: int = 3):
 # 5. מנוע השיחה הראשי
 def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> str:
     """
-    Handles an incoming WhatsApp message from a given sender, keeping a
-    persistent multi-turn conversation per sender, and executes function
+    Handles an incoming WhatsApp message from a given sender, restoring the
+    conversation from storage so it survives restarts, and executing function
     calls automatically when Gemini triggers them.
     """
     try:
         chat = _get_session(sender_id)
         response = _send_with_retry(chat, incoming_text)
+        if storage.enabled():
+            storage.save_history(sender_id, _serialise(chat.get_history()))
     except genai_errors.ClientError as e:
         logger.error(f"Gemini client error for sender {sender_id}: {e}")
         # A 429 on the free tier is a daily quota that will not clear on a retry,

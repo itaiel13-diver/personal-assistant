@@ -1,5 +1,6 @@
 google-genai
 google-api-python-client
+psycopg[binary]
 flask
 requests
 gunicorn

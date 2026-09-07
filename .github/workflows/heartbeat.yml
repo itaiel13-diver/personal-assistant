@@ -33,12 +33,25 @@ jobs:
         env:
           TICK_URL: ${{ secrets.TICK_URL }}
         run: |
-          if [ -z "$TICK_URL" ]; then
+          # Pasting a URL into the GitHub secrets box picks up a trailing
+          # newline or a stray space more often than not, and curl answers that
+          # with "URL rejected: Malformed input", which reads like a broken
+          # address rather than invisible whitespace. So strip it here instead
+          # of asking anyone to paste it a second time. Quotes go too - a value
+          # pasted with them is a URL with quote marks in it.
+          url=$(printf '%s' "$TICK_URL" | tr -d '[:space:]' | tr -d '"'"'"'"')
+
+          if [ -z "$url" ]; then
             echo "TICK_URL is not set — add it under Settings → Secrets and variables → Actions."
             exit 1
           fi
+          case "$url" in
+            https://*) ;;
+            *) echo "TICK_URL does not start with https:// — check the value."; exit 1 ;;
+          esac
+
           # --max-time is generous on purpose: a sleeping Render instance takes
           # the better part of a minute to come back up, and that first slow
           # call is exactly the one that matters.
           curl --silent --show-error --fail --retry 3 --retry-delay 20 \
-               --max-time 120 "$TICK_URL"
+               --max-time 120 "$url"

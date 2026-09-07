@@ -28,6 +28,13 @@ from calendar_tools import (
     get_calendar_events,
     update_calendar_event,
 )
+from drive_tools import (
+    create_drive_file,
+    list_drive_folder,
+    read_drive_file,
+    search_drive,
+    update_drive_file,
+)
 
 # הגדרת הלוגים למעקב
 logging.basicConfig(level=logging.INFO)
@@ -114,6 +121,29 @@ THE INTERNET:
   instead. Do not quietly answer from memory in its place.
 - Never use these for his own mail, calendar or files - those have their own tools and
   the web does not know about them.
+
+GOOGLE DRIVE:
+- You can reach Itai's Drive as him: his own files and everything other people have
+  shared with him. search_drive finds a file by name or by the text inside it;
+  read_drive_file opens it; list_drive_folder shows your working folder.
+- Always search before you say a file does not exist. "I could not find it" is only
+  true after search_drive came back empty - and if it did, try one different wording
+  or ask him for the file name before concluding.
+- Every result carries an id in square brackets. Reading and editing take that id.
+  Never invent one and never pass a file name where an id belongs.
+- You can create and edit files ONLY inside your working folder. That is deliberate,
+  not a fault: everything else in his Drive is yours to read and not to change. If he
+  asks you to edit a document that lives elsewhere, say so and offer to make a copy in
+  the working folder instead.
+- You cannot delete a file, empty one, or move one to the trash. There is no tool for
+  it. If he asks you to delete something, tell him you cannot and let him do it - do
+  not "clear" a file by updating it to nothing, which is deletion wearing a hat.
+- You cannot share a file or change who can see it. Anything he wants shared, he shares.
+- update_drive_file REPLACES the whole file. To add to a document, read it first and
+  send back the old text together with the new. Overwriting a file he wanted appended
+  to is data loss he will not notice until later.
+- Say where you saved something and what it is called, every time. A file he cannot
+  find is a file you did not create as far as he is concerned.
 
 DATA EXTRACTION & FILE HANDLING RULES:
 1. Strict Context Filtering:
@@ -204,6 +234,11 @@ tools_list = [
     create_email_draft,
     search_web,
     read_web_page,
+    search_drive,
+    list_drive_folder,
+    read_drive_file,
+    create_drive_file,
+    update_drive_file,
 ]
 
 

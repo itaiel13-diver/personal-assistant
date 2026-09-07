@@ -1,0 +1,324 @@
+import ast
+from unittest.mock import MagicMock, patch
+
+import drive_tools
+
+FOLDER = "folder-id-1"
+
+
+def _service(files_mock):
+    """A stand-in for the built Drive client, where service.files() is ours."""
+    service = MagicMock()
+    service.files.return_value = files_mock
+    return service
+
+
+def _files(**returns):
+    """A files() resource whose named methods return the given payloads.
+
+    Written this way because every call in drive_tools is the same shape -
+    files().something(...).execute() - so the mock only has to answer .execute().
+    """
+    files = MagicMock()
+    for name, payload in returns.items():
+        getattr(files, name).return_value.execute.return_value = payload
+    return files
+
+
+# --- The three rules the module docstring promises. These are the guard. ---
+
+def _calls(tree):
+    return {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+
+def _tree():
+    return ast.parse(open(drive_tools.__file__, encoding="utf-8").read())
+
+
+def test_module_can_never_delete_or_trash_a_file():
+    """The token carries the full drive scope, so Google would happily let this
+    module delete anything Itai owns. The only thing standing between the
+    assistant and a permanently lost file is that no such call exists here.
+    Parsed rather than grepped so prose about deletion does not trip it."""
+    called = _calls(_tree())
+    assert "delete" not in called, "drive_tools now calls delete() somewhere"
+    assert "empty_trash" not in called
+    public = [n for n in dir(drive_tools) if not n.startswith("_") and callable(getattr(drive_tools, n))]
+    forbidden = [n for n in public if "delete" in n.lower() or "trash" in n.lower() or "remove" in n.lower()]
+    assert not forbidden, f"a deleting function is exposed: {forbidden}"
+
+
+def test_module_can_never_change_who_can_see_a_file():
+    """Sharing is the other irreversible act: a document made public cannot be
+    made private again for whoever already copied it. The assistant has no
+    reason to touch permissions and now no way to."""
+    called = _calls(_tree())
+    assert "permissions" not in called, "drive_tools now touches permissions()"
+    attributes = {
+        node.attr
+        for node in ast.walk(_tree())
+        if isinstance(node, ast.Attribute)
+    }
+    assert "permissions" not in attributes
+
+
+def test_every_new_file_is_created_inside_the_working_folder():
+    """A create() without parents lands in the root of Itai's Drive, which is
+    exactly the mess this design exists to avoid. Checked structurally so a new
+    creation path cannot forget it."""
+    tree = _tree()
+    creates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "create"
+    ]
+    assert creates, "no files().create() found - has the module been restructured?"
+    for call in creates:
+        body = next((kw.value for kw in call.keywords if kw.arg == "body"), None)
+        assert body is not None, "a create() call passes no body"
+        source = ast.dump(body)
+        assert "FOLDER_ID" in source, "a create() call does not put the file in FOLDER_ID"
+
+
+def test_scopes_are_the_ones_the_refresh_token_script_asks_for():
+    """One consent mints one token. If these two lists drift apart, the token in
+    production stops carrying what this module presents, and the failure appears
+    at runtime as an opaque 403."""
+    script = open("scripts/get_gmail_refresh_token.py", encoding="utf-8").read()
+    for scope in drive_tools.SCOPES:
+        assert scope in script, f"{scope} is missing from the refresh-token script"
+
+
+# --- Searching ---
+
+def test_search_covers_files_shared_with_him_by_default():
+    """The half of the request he asked for by name. A search that quietly
+    limited itself to his own files would look like it worked."""
+    files = _files(list={"files": []})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        drive_tools.search_drive("תוכנית עבודה")
+    query = files.list.call_args.kwargs["q"]
+    assert "sharedWithMe" not in query, "the default search excludes shared files"
+    assert "trashed = false" in query
+
+
+def test_search_can_be_narrowed_to_shared_files_only():
+    files = _files(list={"files": []})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        drive_tools.search_drive("מצגת", shared_with_me_only=True)
+    assert "sharedWithMe = true" in files.list.call_args.kwargs["q"]
+
+
+def test_search_looks_inside_files_and_not_only_at_names():
+    files = _files(list={"files": []})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        drive_tools.search_drive("קריית עקרון")
+    query = files.list.call_args.kwargs["q"]
+    assert "fullText contains" in query and "name contains" in query
+
+
+def test_an_apostrophe_in_the_search_does_not_break_the_query():
+    """Drive query literals are single-quoted. Unescaped, O'Brien ends the
+    string early and Google answers with a syntax error instead of results."""
+    files = _files(list={"files": []})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        drive_tools.search_drive("O'Brien")
+    assert "\\'" in files.list.call_args.kwargs["q"]
+
+
+def test_search_results_carry_the_id_the_other_tools_need():
+    files = _files(list={"files": [
+        {"id": "abc123", "name": "דוח ספטמבר", "mimeType": "application/vnd.google-apps.document",
+         "modifiedTime": "2026-09-01T10:00:00Z", "owners": [{"displayName": "ניקיטה"}],
+         "shared": True, "ownedByMe": False},
+    ]})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.search_drive("דוח")
+    assert "[id:abc123]" in out
+    assert "דוח ספטמבר" in out
+    assert "משותף איתך" in out
+
+
+def test_search_with_nothing_to_search_for_does_not_call_google():
+    files = _files(list={"files": []})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.search_drive("   ")
+    files.list.assert_not_called()
+    assert "צריך" in out
+
+
+def test_a_failed_search_explains_itself_instead_of_raising():
+    """Every tool here returns a string to the model. An exception escaping into
+    Gemini's function-calling loop is what produced 'תקלה בחיבור ל-AI' before."""
+    with patch.object(drive_tools, "_drive_service", side_effect=RuntimeError("no token")):
+        out = drive_tools.search_drive("משהו")
+    assert out.startswith("❌")
+    assert "no token" in out
+
+
+# --- Reading ---
+
+def test_a_google_doc_is_exported_because_it_has_no_bytes_to_download():
+    files = _files(
+        get={"id": "d1", "name": "סיכום", "mimeType": "application/vnd.google-apps.document"},
+        export=b"tekst",
+    )
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        with patch.object(drive_tools.attachment_readers, "extract_text", return_value="סיכום הפגישה") as extract:
+            out = drive_tools.read_drive_file("d1")
+    files.export.assert_called_once()
+    files.get_media.assert_not_called()
+    assert extract.call_args.args[0].endswith(".txt")
+    assert out == "סיכום הפגישה"
+
+
+def test_a_spreadsheet_is_exported_as_csv_so_the_row_reader_can_take_it():
+    files = _files(
+        get={"id": "s1", "name": "Z8 Training Status", "mimeType": "application/vnd.google-apps.spreadsheet"},
+        export=b"a,b\n1,2\n",
+    )
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        with patch.object(drive_tools.attachment_readers, "extract_text", return_value="a,b") as extract:
+            drive_tools.read_drive_file("s1")
+    assert files.export.call_args.kwargs["mimeType"] == "text/csv"
+    assert extract.call_args.args[0].endswith(".csv")
+
+
+def test_an_uploaded_file_is_downloaded_rather_than_exported():
+    files = _files(
+        get={"id": "x1", "name": "נתונים.xlsx", "size": "2048",
+             "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        get_media=b"PK\x03\x04",
+    )
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        with patch.object(drive_tools.attachment_readers, "extract_text", return_value="שורות") as extract:
+            drive_tools.read_drive_file("x1")
+    files.get_media.assert_called_once()
+    files.export.assert_not_called()
+    assert extract.call_args.args[0] == "נתונים.xlsx"
+
+
+def test_a_file_too_large_to_read_says_so_before_downloading_it():
+    """The size check has to happen on the metadata. Downloading 80MB into a
+    512MB container to then refuse it is how the free tier gets killed."""
+    files = _files(
+        get={"id": "big", "name": "ענק.pdf", "size": str(200 * 1024 * 1024), "mimeType": "application/pdf"},
+    )
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.read_drive_file("big")
+    files.get_media.assert_not_called()
+    assert "גדול מדי" in out
+
+
+def test_reading_a_folder_says_it_is_a_folder():
+    files = _files(get={"id": "f1", "name": "עבודה", "mimeType": drive_tools.FOLDER_MIME})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.read_drive_file("f1")
+    assert "תיקייה" in out
+
+
+def test_the_part_number_is_passed_through_so_long_files_can_be_finished():
+    """read_email_attachment already paginates and the prompt tells the model to
+    keep going to the last part. A Drive file has to behave the same way or the
+    model will believe it read a file it only saw the first page of."""
+    files = _files(
+        get={"id": "d1", "name": "ארוך", "mimeType": "application/vnd.google-apps.document"},
+        export=b"x",
+    )
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        with patch.object(drive_tools.attachment_readers, "extract_text", return_value="חלק 2") as extract:
+            drive_tools.read_drive_file("d1", part=2)
+    assert extract.call_args.kwargs["part"] == 2
+
+
+# --- Writing, and the folder that bounds it ---
+
+def test_a_new_file_goes_into_the_working_folder():
+    files = _files(create={"id": "new1", "name": "סיכום", "webViewLink": "https://drive.google.com/x"})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.create_drive_file("סיכום", "תוכן")
+    assert files.create.call_args.kwargs["body"]["parents"] == [FOLDER]
+    assert "[id:new1]" in out
+
+
+def test_a_sheet_is_created_as_a_real_google_sheet_from_csv():
+    files = _files(create={"id": "s2", "name": "טבלה"})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            drive_tools.create_drive_file("טבלה", "עיר,סטטוס\nלוד,בוצע", file_type="sheet")
+    assert files.create.call_args.kwargs["body"]["mimeType"] == "application/vnd.google-apps.spreadsheet"
+
+
+def test_an_unknown_file_type_is_refused_rather_than_guessed():
+    files = _files(create={"id": "no"})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.create_drive_file("קובץ", "תוכן", file_type="pdf")
+    files.create.assert_not_called()
+    assert out.startswith("❌")
+
+
+def test_without_a_configured_folder_nothing_is_written_anywhere():
+    """An unset DRIVE_FOLDER_ID means 'nowhere', never 'anywhere'. If it meant
+    'the root of his Drive' a missing environment variable would quietly turn
+    into files scattered across it."""
+    files = _files(create={"id": "no"})
+    with patch.object(drive_tools, "FOLDER_ID", ""):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            created = drive_tools.create_drive_file("קובץ", "תוכן")
+            updated = drive_tools.update_drive_file("some-id", "תוכן")
+    files.create.assert_not_called()
+    files.update.assert_not_called()
+    assert created.startswith("❌") and updated.startswith("❌")
+
+
+def test_a_file_outside_the_working_folder_is_read_only():
+    """The point of the whole design: a spreadsheet a colleague shared can be
+    read and must not be overwritten by an assistant that misunderstood."""
+    files = _files(get={"parents": ["someone-elses-folder"]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.update_drive_file("shared-file", "תוכן חדש")
+    files.update.assert_not_called()
+    assert out.startswith("❌")
+    assert "עותק" in out, "the refusal should offer the copy that would work"
+
+
+def test_a_file_inside_the_working_folder_can_be_edited():
+    files = MagicMock()
+    files.get.return_value.execute.side_effect = [
+        {"parents": [FOLDER]},
+        {"mimeType": "application/vnd.google-apps.document", "name": "סיכום"},
+    ]
+    files.update.return_value.execute.return_value = {"id": "mine", "name": "סיכום"}
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.update_drive_file("mine", "תוכן חדש")
+    files.update.assert_called_once()
+    assert out.startswith("✅")
+
+
+def test_the_working_folder_listing_is_scoped_to_that_folder():
+    files = _files(list={"files": []})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            drive_tools.list_drive_folder()
+    assert f"'{FOLDER}' in parents" in files.list.call_args.kwargs["q"]
+
+
+def test_a_long_listing_is_truncated_instead_of_flooding_whatsapp():
+    files = _files(list={"files": [
+        {"id": f"id{i}", "name": "קובץ עם שם ארוך מאוד " * 12, "mimeType": "text/plain"}
+        for i in range(15)
+    ]})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.search_drive("קובץ")
+    assert len(out) <= drive_tools.MAX_LISTING_CHARS + 40
+    assert "קוצרה" in out

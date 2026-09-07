@@ -246,3 +246,26 @@ def test_the_prompt_and_the_enforced_cap_say_the_same_number():
     assert web_tools.MAX_SEARCHES_PER_MESSAGE == 2
     assert "TWO searches per message" in assistant.SYSTEM_PROMPT
     assert "ask Itai one short question instead of searching" in assistant.SYSTEM_PROMPT
+
+
+def test_the_drive_tools_are_actually_registered():
+    """A tool the model cannot see does not exist. drive_tools passing its own
+    tests proves the module works, not that Gemini was ever offered it."""
+    names = {t.__name__ for t in assistant.tools_list}
+    assert {
+        "search_drive",
+        "list_drive_folder",
+        "read_drive_file",
+        "create_drive_file",
+        "update_drive_file",
+    } <= names
+
+
+def test_the_prompt_does_not_promise_drive_powers_the_code_refuses():
+    """The model is told it cannot delete and cannot share. If someone later adds
+    those tools without revisiting the prompt, or softens the prompt without
+    adding them, one of these two halves is lying to Itai."""
+    assert "You cannot delete a file" in assistant.SYSTEM_PROMPT
+    assert "You cannot share a file" in assistant.SYSTEM_PROMPT
+    names = {t.__name__ for t in assistant.tools_list}
+    assert not any("delete_drive" in n or "share" in n for n in names)

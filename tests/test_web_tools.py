@@ -32,6 +32,17 @@ def _response(text, sources=()):
 
 
 @pytest.fixture(autouse=True)
+def fresh_search_budget():
+    """Each test starts a message of its own.
+
+    The budget is deliberately per-thread and not per-call, so without this one
+    test spending it would silently starve the next one - and the failure would
+    look like a bug in whatever test happened to run fourth.
+    """
+    web_tools.begin_message()
+
+
+@pytest.fixture(autouse=True)
 def no_search_key(monkeypatch):
     """Most tests here exercise the Gemini fallback, which only runs when no
     Tavily key is set. Without this the suite would pass or fail depending on
@@ -336,3 +347,116 @@ def test_without_a_key_the_refusal_names_the_free_alternative(monkeypatch):
     out = web_tools.search_web("שאלה")
     assert "Tavily" in out
     assert "429" not in out and "RESOURCE_EXHAUSTED" not in out
+
+
+# --- the two-search budget ---------------------------------------------------
+#
+# Written after watching one WhatsApp question turn into ten live searches:
+# Gemini's automatic function calling will keep calling a tool until it is
+# satisfied or hits its own limit of ten, and it drifted between two sports
+# rather than asking which was meant. The prompt asks it not to; these tests
+# cover the part that does not depend on it complying.
+
+
+def test_two_searches_go_through(captured):
+    assert web_tools.search_web("שאלה ראשונה") == "תשובה"
+    assert web_tools.search_web("שאלה שנייה") == "תשובה"
+    assert len(captured) == 2
+
+
+def test_the_third_search_in_one_message_is_refused(captured):
+    web_tools.search_web("ראשונה")
+    web_tools.search_web("שנייה")
+    out = web_tools.search_web("שלישית")
+
+    assert len(captured) == 2, "the refused call must not reach the search backend"
+    assert "נגמרו" in out
+
+
+def test_the_refusal_tells_the_model_what_to_do_instead(captured):
+    web_tools.search_web("הפועל תל אביב כדורגל")
+    web_tools.search_web("הפועל תל אביב כדורסל")
+    out = web_tools.search_web("הפועל תל אביב משחק")
+
+    # It has to name what was already searched, or the model cannot tell which
+    # of its ideas it has already tried.
+    assert "הפועל תל אביב כדורגל" in out and "הפועל תל אביב כדורסל" in out
+    # And it has to offer the way out that a refusal alone does not: ask Itai.
+    assert "הבהרה" in out
+
+
+def test_repeating_a_question_costs_nothing_and_returns_the_first_answer(monkeypatch):
+    answers = iter(["התשובה האמיתית", "תשובה אחרת"])
+    monkeypatch.setattr(web_tools, "_ask", lambda *a, **k: next(answers))
+
+    first = web_tools.search_web("מתי המשחק")
+    second = web_tools.search_web("מתי המשחק")
+    assert first == second == "התשובה האמיתית"
+
+
+def test_a_repeat_does_not_eat_the_budget(captured):
+    web_tools.search_web("אותה שאלה")
+    web_tools.search_web("אותה שאלה")   # free - answered from what came back
+    web_tools.search_web("שאלה אחרת")
+    assert len(captured) == 2, "the repeat must not have counted as one of the two"
+
+
+def test_a_repeat_is_recognised_through_spacing_and_case(captured):
+    web_tools.search_web("Hapoel Tel Aviv match")
+    web_tools.search_web("  hapoel   tel aviv MATCH ")
+    assert len(captured) == 1
+
+
+def test_an_empty_query_costs_no_budget(captured):
+    assert "צריך שאלה" in web_tools.search_web("   ")
+    web_tools.search_web("א")
+    web_tools.search_web("ב")
+    assert len(captured) == 2
+
+
+def test_a_failed_search_still_counts(monkeypatch):
+    """Otherwise a backend that is down turns into an unbounded retry loop -
+    the one shape of runaway the cap exists to prevent."""
+    calls = []
+
+    def failing(*a, **k):
+        calls.append(1)
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(web_tools, "_ask", failing)
+    for query in ("א", "ב", "ג", "ד"):
+        web_tools.search_web(query)
+    assert len(calls) == 2
+
+
+def test_the_next_message_gets_a_full_budget_again(captured):
+    web_tools.search_web("א")
+    web_tools.search_web("ב")
+    web_tools.begin_message()
+    web_tools.search_web("ג")
+    web_tools.search_web("ד")
+    assert len(captured) == 4
+
+
+def test_each_message_thread_holds_its_own_budget(captured):
+    """The webhook answers each message inside its own request thread. A shared
+    counter would let a message arriving mid-search cut the first one short."""
+    import threading
+
+    web_tools.search_web("א")
+    web_tools.search_web("ב")          # this thread is now out
+
+    other = []
+    thread = threading.Thread(target=lambda: other.append(web_tools.search_web("ג")))
+    thread.start()
+    thread.join(timeout=5)
+    assert other == ["תשובה"], "a second message must not inherit a spent budget"
+
+
+def test_the_tool_description_tells_the_model_to_ask_rather_than_guess():
+    """search_web's docstring is what Gemini reads when it decides how to use the
+    tool. The ten-search run happened because it guessed the subject instead of
+    asking, so that instruction living in the description is load-bearing."""
+    doc = web_tools.search_web.__doc__
+    assert "two searches" in doc
+    assert "ask him one short question" in doc

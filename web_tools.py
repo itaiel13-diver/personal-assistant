@@ -51,9 +51,14 @@ pages behind it, which is exactly the shape this module already hands back, and
 
 Gemini grounding is kept as the path when no Tavily key is configured, so the
 assistant degrades to the honest refusal instead of to silence.
+
+Searching is rationed: two lookups per incoming WhatsApp message, enforced here
+rather than asked for in the prompt. See MAX_SEARCHES_PER_MESSAGE for what
+happened without it.
 """
 import logging
 import os
+import threading
 
 from google import genai
 from google.genai import types
@@ -81,6 +86,49 @@ MAX_SOURCES = 5
 # falls back to Gemini grounding, which answers with its own refusal.
 TAVILY_URL = "https://api.tavily.com/search"
 TAVILY_TIMEOUT_SECONDS = 20
+
+# Live searches allowed per incoming WhatsApp message. This is not a cost
+# control - 1,000 free credits a month is far past what one person spends over
+# WhatsApp. It is here because a model that is allowed ten searches will take
+# ten: on 2026-09-06 a single question about a football fixture produced ten
+# search_web calls in one turn, drifting between basketball and football
+# because it never established which sport was meant, and took nearly a minute
+# to answer a question Itai ended up answering himself. Two is enough for one
+# lookup plus one correction. Past that the move that actually helps is to ask
+# him, not to rephrase the guess a third time.
+#
+# The cap is enforced here rather than in the system prompt because the prompt
+# was not what failed. Gemini's automatic function calling will make up to ten
+# tool calls per turn on its own, and a sentence asking it not to is a request;
+# this is a refusal it cannot route around.
+MAX_SEARCHES_PER_MESSAGE = 2
+
+# Per-thread, because the budget belongs to one incoming message and the
+# webhook handles each message start to finish inside its own request thread.
+# A plain module-level counter would be reset by a second message arriving
+# while the first was still searching.
+_budget = threading.local()
+
+
+def begin_message() -> None:
+    """Starts a fresh search budget. Called once per incoming WhatsApp message.
+
+    Without it the count carries over and the second question of the day finds
+    the budget already spent.
+    """
+    _budget.spent = 0
+    _budget.answers = {}
+
+
+def _state():
+    """The budget for the message in flight, created on demand.
+
+    Anything that calls a tool without going through the webhook - a test, a
+    script, the REPL - gets a budget of its own instead of an AttributeError.
+    """
+    if not hasattr(_budget, "spent"):
+        begin_message()
+    return _budget
 
 _client = None
 
@@ -238,8 +286,22 @@ def search_web(query: str) -> str:
     true. Anything time-sensitive belongs here - your training data has a cutoff
     and Itai does not know where it falls, so guessing reads as a confident lie.
 
-    Ask a full question in the query, in whichever language Itai used. Hebrew
-    works and is usually better for Israeli subjects.
+    You get two searches per message and no more. Make them count:
+
+    - Ask one full, specific question rather than several rewordings of the same
+      one. Put in what pins it down - the date, the city, the exact team, whether
+      it is כדורגל or כדורסל. A vague query costs the same as a precise one and
+      comes back vague.
+    - If you cannot tell what Itai meant, ask him one short question instead of
+      searching. Guessing the subject is the main way both searches get burned.
+    - Read the result before you search again. It already carries its sources.
+      Spend the second search only on a gap the first one left - never on the
+      same question in other words.
+    - When the budget is gone, answer with what you found and say what is
+      missing. Do not apologise for the limit; just be useful with what you have.
+
+    Ask the question in whichever language Itai used. Hebrew works and is
+    usually better for Israeli subjects.
 
     This tool may report that live search is unavailable on the current plan. If
     it does, say so plainly and offer to open a specific link with read_web_page
@@ -257,8 +319,43 @@ def search_web(query: str) -> str:
     query = (query or "").strip()
     if not query:
         return "צריך שאלה לחיפוש."
-    logger.info(f"Web tool: search_web(query={query!r})")
 
+    state = _state()
+    key = " ".join(query.lower().split())
+
+    # Asking the identical question twice inside one message is the cheap half
+    # of the waste and the easy half to refuse: hand back what the first search
+    # returned rather than buying the same answer again. A repeat costs no
+    # credit and no budget - it was already paid for.
+    if key in state.answers:
+        logger.info(f"Web tool: search_web repeat, answered from this message: {query!r}")
+        return state.answers[key]
+
+    if state.spent >= MAX_SEARCHES_PER_MESSAGE:
+        already = " · ".join(state.answers) or "—"
+        logger.info(f"Web tool: search_web budget spent, refused {query!r}")
+        return (
+            f"[הערת מערכת] נגמרו {MAX_SEARCHES_PER_MESSAGE} החיפושים המותרים "
+            f"להודעה הזאת. כבר חיפשת: {already}. אל תחפש שוב — ענה לאיתי עם מה "
+            "שכבר מצאת וציין מה חסר, ואם לא ברור מה הוא התכוון תשאל אותו שאלת "
+            "הבהרה אחת קצרה במקום לנחש."
+        )
+
+    state.spent += 1
+    logger.info(
+        f"Web tool: search_web(query={query!r}) "
+        f"[{state.spent}/{MAX_SEARCHES_PER_MESSAGE}]"
+    )
+    answer = _run_search(query)
+    # Cached even when it is an error message. A retry of the identical query
+    # would fail the identical way, and a second failure is worth less than the
+    # seconds it takes.
+    state.answers[key] = answer
+    return answer
+
+
+def _run_search(query: str) -> str:
+    """The lookup itself, once the budget has allowed it."""
     if os.environ.get("TAVILY_API_KEY", "").strip():
         try:
             return _tavily_search(query)

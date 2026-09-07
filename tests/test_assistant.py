@@ -212,3 +212,37 @@ def test_handle_whatsapp_message_returns_hebrew_fallback_on_persistent_failure(m
     result = assistant.handle_whatsapp_message("test", sender_id="sender-x")
     assert "תקלה זמנית" in result
     assert fake_chat.send_message.call_count == 3  # exhausted all retry attempts
+
+
+def test_every_incoming_message_gets_a_fresh_search_budget(monkeypatch):
+    """The cap is per message, so something has to zero it per message. If this
+    wiring is ever dropped, the first two searches of the day would work and
+    every search after that would be refused - a failure that only shows up on
+    the second question and looks like the internet being broken."""
+    import web_tools
+
+    fake_chat = MagicMock()
+    fake_chat.send_message.return_value = MagicMock(text="בסדר")
+    fake_client = MagicMock()
+    fake_client.chats.create.return_value = fake_chat
+    monkeypatch.setattr(assistant, "client", fake_client)
+    monkeypatch.setattr(web_tools, "_ask", lambda *a, **k: "תשובה")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    web_tools.search_web("א")
+    web_tools.search_web("ב")
+    assert "נגמרו" in web_tools.search_web("ג")   # budget spent
+
+    assistant.handle_whatsapp_message("שאלה חדשה", sender_id="sender-budget")
+    assert web_tools.search_web("ד") == "תשובה"
+
+
+def test_the_prompt_and_the_enforced_cap_say_the_same_number():
+    """The prompt spells the limit out in words for the model, and web_tools
+    enforces it as an integer. Nothing keeps the two in step automatically, so
+    changing the constant has to fail here until the prompt is changed too."""
+    import web_tools
+
+    assert web_tools.MAX_SEARCHES_PER_MESSAGE == 2
+    assert "TWO searches per message" in assistant.SYSTEM_PROMPT
+    assert "ask Itai one short question instead of searching" in assistant.SYSTEM_PROMPT

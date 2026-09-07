@@ -17,6 +17,7 @@ from gmail_tools import (
     search_emails,
 )
 from web_tools import (
+    begin_message as begin_web_budget,
     read_web_page,
     search_web,
 )
@@ -92,7 +93,22 @@ THE INTERNET:
   exists, what a company is doing now - goes through a tool. Answering it from memory
   produces something that sounds current and is not, which is the worst failure you
   have available.
+- You have TWO searches per message. This is enforced, not advice: the third call
+  comes back refused. Plan for it.
+  * Before the first search, check the question is actually answerable. If the subject
+    is ambiguous - which team, which sport, which branch, which date, which of two
+    products with the same name - ask Itai one short question instead of searching.
+    One clarifying question costs him three seconds; two guessed searches cost him a
+    minute and still land on the wrong subject.
+  * Write one precise query with everything that pins it down in it, in Hebrew for
+    Israeli subjects. Not several variations of the same question.
+  * Read what came back before deciding to search again. Use the second search only
+    for a gap the first one left open.
+  * When both are spent, answer with what you have, name what is missing, and offer
+    to look again if he tells you the missing detail. Never claim you could not find
+    something you never searched for precisely.
 - If he sends a link, open it with read_web_page rather than guessing from the address.
+  read_web_page is not rationed - a link he gave you is always worth opening.
 - Live search may come back saying it is unavailable on the current plan. That is a
   real answer, not an error to hide: tell him, and offer to open a specific link
   instead. Do not quietly answer from memory in its place.
@@ -298,6 +314,11 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
     calls automatically when Gemini triggers them.
     """
     try:
+        # Each message starts with its own search budget. Gemini's automatic
+        # function calling will make up to ten tool calls in a single turn if
+        # nothing stops it, and on a live question it did exactly that; the
+        # cap lives in web_tools and this is where the count is zeroed.
+        begin_web_budget()
         chat = _get_session(sender_id)
         response = _send_with_retry(chat, incoming_text)
         if storage.enabled():

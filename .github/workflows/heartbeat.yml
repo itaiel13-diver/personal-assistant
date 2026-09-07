@@ -1,0 +1,44 @@
+# The assistant's clock.
+#
+# It lives here rather than inside the app because the app is on Render's free
+# plan, which puts the instance to sleep after ~15 minutes of quiet. A
+# scheduler running inside a sleeping process never fires. So the beat comes
+# from outside: this calls /tick, the call itself wakes the instance, and the
+# instance then asks its routines what is due.
+#
+# The schedule is UTC and Israel moves between UTC+2 and UTC+3, so the window
+# is drawn wide enough to cover the waking day in either. Nothing here decides
+# what to send - run_tick matches a 75-minute window precisely because these
+# pings are irregular, and every message is claimed in the database before it
+# goes out, so an extra tick is harmless.
+name: heartbeat
+
+on:
+  schedule:
+    - cron: "*/30 4-20 * * *"
+  workflow_dispatch:
+
+# One beat at a time. A run still waiting on a cold start must not be joined
+# by the next one.
+concurrency:
+  group: heartbeat
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake the assistant and ask what is due
+        env:
+          TICK_URL: ${{ secrets.TICK_URL }}
+        run: |
+          if [ -z "$TICK_URL" ]; then
+            echo "TICK_URL is not set — add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          # --max-time is generous on purpose: a sleeping Render instance takes
+          # the better part of a minute to come back up, and that first slow
+          # call is exactly the one that matters.
+          curl --silent --show-error --fail --retry 3 --retry-delay 20 \
+               --max-time 120 "$TICK_URL"

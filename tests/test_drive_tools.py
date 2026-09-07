@@ -1,4 +1,5 @@
 import ast
+import inspect
 from unittest.mock import MagicMock, patch
 
 import drive_tools
@@ -39,17 +40,53 @@ def _tree():
     return ast.parse(open(drive_tools.__file__, encoding="utf-8").read())
 
 
-def test_module_can_never_delete_or_trash_a_file():
-    """The token carries the full drive scope, so Google would happily let this
-    module delete anything Itai owns. The only thing standing between the
-    assistant and a permanently lost file is that no such call exists here.
-    Parsed rather than grepped so prose about deletion does not trip it."""
-    called = _calls(_tree())
-    assert "delete" not in called, "drive_tools now calls delete() somewhere"
-    assert "empty_trash" not in called
-    public = [n for n in dir(drive_tools) if not n.startswith("_") and callable(getattr(drive_tools, n))]
-    forbidden = [n for n in public if "delete" in n.lower() or "trash" in n.lower() or "remove" in n.lower()]
-    assert not forbidden, f"a deleting function is exposed: {forbidden}"
+def test_deleting_a_file_means_the_bin_unless_asked_otherwise():
+    """This module used to have no way to remove a file at all. Itai lifted that
+    on 2026-09-07 - they are his files, and he would rather have the verb and
+    narrow it later than keep hitting a wall. What is guarded now is the
+    default: an ordinary call bins the file, which Drive keeps recoverable for
+    30 days, and the irreversible delete has to be asked for by name."""
+    signature = inspect.signature(drive_tools.trash_drive_file)
+    assert signature.parameters["permanent"].default is False, (
+        "trash_drive_file now destroys files unless told not to"
+    )
+
+    files = _files(
+        get={"name": "דוח ספטמבר", "ownedByMe": True, "trashed": False},
+        update={"id": "f1"},
+    )
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.trash_drive_file("f1")
+
+    files.delete.assert_not_called()
+    assert files.update.call_args.kwargs["body"] == {"trashed": True}
+    assert "דוח ספטמבר" in out and "30 יום" in out
+
+
+def test_a_permanent_delete_happens_only_when_it_is_asked_for():
+    """The one call in the module with no undo. It must reach files().delete()
+    when asked - a 'permanent' flag that quietly still bins would be worse than
+    no flag - and must say plainly that nothing can be recovered."""
+    files = _files(get={"name": "טיוטה ישנה", "ownedByMe": True, "trashed": False})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.trash_drive_file("f9", permanent=True)
+
+    files.delete.assert_called_once()
+    assert files.delete.call_args.kwargs["fileId"] == "f9"
+    files.update.assert_not_called()
+    assert "לצמיתות" in out
+
+
+def test_binning_something_already_in_the_bin_does_not_call_google_again():
+    """Cheap, but it is the difference between a truthful answer and a second
+    confirmation that implies work happened twice."""
+    files = _files(get={"name": "כבר בפח", "ownedByMe": True, "trashed": True})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.trash_drive_file("f2")
+
+    files.update.assert_not_called()
+    files.delete.assert_not_called()
+    assert "כבר" in out
 
 
 def test_module_can_never_change_who_can_see_a_file():

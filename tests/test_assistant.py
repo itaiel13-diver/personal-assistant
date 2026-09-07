@@ -261,11 +261,22 @@ def test_the_drive_tools_are_actually_registered():
     } <= names
 
 
-def test_the_prompt_does_not_promise_drive_powers_the_code_refuses():
-    """The model is told it cannot delete and cannot share. If someone later adds
-    those tools without revisiting the prompt, or softens the prompt without
-    adding them, one of these two halves is lying to Itai."""
-    assert "You cannot delete a file" in assistant.SYSTEM_PROMPT
+def test_the_prompt_and_the_toolbox_agree_about_sharing():
+    """Sharing is the Drive power the code still refuses. If someone adds a tool
+    for it without revisiting the prompt, or softens the prompt without adding
+    the tool, one of these two halves is lying to Itai."""
     assert "You cannot share a file" in assistant.SYSTEM_PROMPT
     names = {t.__name__ for t in assistant.tools_list}
-    assert not any("delete_drive" in n or "share" in n for n in names)
+    assert not any("share" in n or "permission" in n for n in names)
+
+
+def test_the_prompt_tells_the_model_the_bin_is_the_default_and_not_destruction():
+    """Deleting became possible on 2026-09-07 at Itai's request. The prompt has
+    to carry the shape of it, not just the fact: an ordinary removal goes to the
+    bin, and permanent=True is something he asks for rather than something the
+    model reaches for on its own."""
+    prompt = assistant.SYSTEM_PROMPT
+    assert "trash_drive_file" in prompt
+    assert "recoverable for 30 days" in prompt
+    assert "Never pass that" in prompt
+    assert assistant.trash_drive_file in assistant.tools_list

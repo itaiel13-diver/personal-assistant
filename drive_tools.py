@@ -1,4 +1,4 @@
-"""Google Drive for the assistant: reads widely, writes in one folder, deletes never.
+"""Google Drive for the assistant: reads widely, writes in one folder, can bin a file.
 
 Why this is OAuth as Itai and not the service account. The calendar works
 through a service account because a calendar can be *shared* with one. Drive
@@ -18,20 +18,32 @@ can send, and the assistant cannot, because gmail_tools exposes no way to.
 
 The three rules this module keeps:
 
-  1. It never deletes and never trashes. There is no function for it and no
-     call to files().delete() anywhere. A wrong answer costs a correction; a
-     deleted file can cost work that has no other copy.
-  2. It never changes who can see a file. No permissions() call, ever - the
-     assistant cannot share Itai's documents with anyone, by mistake or
-     otherwise.
+  1. Removing a file means the bin, not destruction. trash_drive_file sets
+     trashed=true, which Drive keeps recoverable for 30 days and which Itai can
+     undo himself from the Drive UI without asking anyone. Permanent deletion
+     exists behind an explicit permanent=True, and it is the one call in this
+     module with no undo, so its tool description tells the model to confirm in
+     words before using it that way.
+
+     This rule used to read "it never deletes and never trashes". Itai changed
+     it on 2026-09-07, deliberately and as the owner of the files: his standing
+     preference is to be handed the full capability and to narrow it afterwards
+     if something goes wrong, rather than to keep discovering a missing verb
+     mid-task. The bin default is what survived of the old caution, and it is
+     enough, because it is reversible.
+  2. It still never changes who can see a file. No permissions() call, ever -
+     the assistant cannot share Itai's documents with anyone, by mistake or
+     otherwise. Deletion is destructive but private and undoable; sharing is
+     neither, because a document read by the wrong person cannot be unread.
+     This one stays until Itai asks for it by name.
   3. It only writes inside DRIVE_FOLDER_ID. New files are created there, and an
      edit is refused unless the file is already in that folder. Everything
      outside it is readable and not writable.
 
-Rules 1-3 are enforced by a test that reads this file's syntax tree, on the
+Rules 2-3 are enforced by a test that reads this file's syntax tree, on the
 model of test_module_exposes_no_way_to_send_mail. If a future change needs one
 of them relaxed, that test is the conversation - not an obstacle to route
-around.
+around. Rule 1 had that conversation, and the answer was yes.
 """
 
 import io
@@ -367,3 +379,51 @@ def update_drive_file(file_id: str, content: str) -> str:
     except Exception as e:
         logger.error(f"update_drive_file failed for {file_id!r}: {e}")
         return f"❌ עדכון הקובץ נכשל: {e}"
+
+
+def trash_drive_file(file_id: str, permanent: bool = False) -> str:
+    """Moves a file in Itai's Drive to the bin, or deletes it for good.
+
+    The default puts the file in the Drive bin, where it stays recoverable for
+    30 days and Itai can restore it himself. Use permanent=True only when he
+    has said in this conversation that he wants it gone for good - that one has
+    no undo, so confirm it with him in words before calling it that way.
+
+    Unlike editing, this is not restricted to the working folder: it can bin
+    anything Itai owns anywhere in his Drive. A file somebody else owns cannot
+    be binned by him at all, and Google's refusal is reported as it comes.
+
+    Args:
+        file_id: The file's Drive id, as it comes back from search_drive.
+        permanent: True to delete for good instead of binning. Ask first.
+
+    Returns:
+        Confirmation naming the file, or the reason Google refused.
+    """
+    file_id = (file_id or "").strip()
+    if not file_id:
+        return _refuse_write("צריך מזהה קובץ.")
+
+    logger.info(f"Drive tool: trash_drive_file(file_id={file_id!r}, permanent={permanent})")
+    try:
+        service = _drive_service()
+        # Read the name before acting: the confirmation has to say what actually
+        # went, and after a permanent delete there is nothing left to ask.
+        meta = service.files().get(
+            fileId=file_id, fields="name, ownedByMe, trashed", supportsAllDrives=True
+        ).execute()
+        name = meta.get("name", "(ללא שם)")
+        if meta.get("trashed") and not permanent:
+            return f"ℹ️ הקובץ {name!r} כבר נמצא בפח של הדרייב."
+        if permanent:
+            service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+            return f"🗑️ {name!r} נמחק לצמיתות. אין דרך לשחזר אותו."
+        service.files().update(
+            fileId=file_id, body={"trashed": True}, fields="id", supportsAllDrives=True
+        ).execute()
+        return (
+            f"🗑️ {name!r} הועבר לפח בדרייב, וניתן לשחזור משם במשך 30 יום."
+        )
+    except Exception as e:
+        logger.error(f"trash_drive_file failed for {file_id!r}: {e}")
+        return f"❌ לא הצלחתי למחוק את הקובץ: {e}"

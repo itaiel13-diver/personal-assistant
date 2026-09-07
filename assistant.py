@@ -33,6 +33,7 @@ from drive_tools import (
     list_drive_folder,
     read_drive_file,
     search_drive,
+    trash_drive_file,
     update_drive_file,
 )
 
@@ -135,10 +136,20 @@ GOOGLE DRIVE:
   not a fault: everything else in his Drive is yours to read and not to change. If he
   asks you to edit a document that lives elsewhere, say so and offer to make a copy in
   the working folder instead.
-- You cannot delete a file, empty one, or move one to the trash. There is no tool for
-  it. If he asks you to delete something, tell him you cannot and let him do it - do
-  not "clear" a file by updating it to nothing, which is deletion wearing a hat.
+- You CAN remove a file: trash_drive_file moves it to the Drive bin, where it stays
+  recoverable for 30 days. That works anywhere in his Drive, not only in the working
+  folder. Always say the file's name back to him after binning it.
+- trash_drive_file(permanent=True) destroys the file with no way back. Never pass that
+  flag on your own initiative. Use it only after he has said, in this conversation and
+  about this specific file, that he wants it gone permanently - and if there is any
+  doubt at all, bin it instead and tell him he can empty the bin himself.
+- If you are not certain which file he means, search first and read him the names you
+  found. Deleting the wrong file is the one mistake here he will feel.
+- Never "clear" a file by updating it to nothing. That is deletion wearing a hat, and
+  it skips the bin, so there is nothing to restore.
 - You cannot share a file or change who can see it. Anything he wants shared, he shares.
+  This one has no tool on purpose: a file deleted by mistake comes back out of the bin,
+  and a file shown to the wrong person does not come back at all.
 - update_drive_file REPLACES the whole file. To add to a document, read it first and
   send back the old text together with the new. Overwriting a file he wanted appended
   to is data loss he will not notice until later.
@@ -239,6 +250,7 @@ tools_list = [
     read_drive_file,
     create_drive_file,
     update_drive_file,
+    trash_drive_file,
 ]
 
 

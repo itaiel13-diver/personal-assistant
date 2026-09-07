@@ -40,6 +40,7 @@ class FakeLedger:
     def __init__(self, sender="972500000000", wrote_at=_DEFAULT, now=None):
         self.claimed = set()
         self.released = []
+        self.turns = []
         self.sender = sender
         if wrote_at is self._DEFAULT:
             wrote_at = now - timedelta(hours=1) if now else None
@@ -61,6 +62,9 @@ class FakeLedger:
     def last_inbound(self):
         return (self.sender, self.wrote_at)
 
+    def append_model_turn(self, sender_id, text):
+        self.turns.append((sender_id, text))
+
 
 class Outbox:
     def __init__(self, ok=True):
@@ -76,10 +80,40 @@ class Outbox:
 def ledger(monkeypatch):
     def install(now=None, **kwargs):
         fake = FakeLedger(now=now, **kwargs)
-        for name in ("enabled", "claim", "release", "last_inbound"):
+        for name in ("enabled", "claim", "release", "last_inbound",
+                     "append_model_turn"):
             monkeypatch.setattr(proactive.storage, name, getattr(fake, name))
         return fake
     return install
+
+
+@pytest.fixture(autouse=True)
+def inbox(monkeypatch):
+    """Every test gets an empty mailbox unless it asks for one with mail in it.
+
+    This is autouse on purpose: new_mail is in the default ROUTINES, so without
+    it a test of the attendance reminder would reach out to Gmail over the
+    network to find out that it has nothing to say.
+    """
+    import gmail_tools
+
+    box = []
+
+    def fake_list(query="", max_results=10):
+        return box[:max_results]
+
+    monkeypatch.setattr(gmail_tools, "list_inbox_messages", fake_list)
+
+    def fill(*messages):
+        box.clear()
+        box.extend(messages)
+        return box
+    return fill
+
+
+def mail(id, sender="dana@impact.co.il", subject="נושא", snippet="גוף ההודעה"):
+    return {"id": id, "sender": sender, "subject": subject,
+            "snippet": snippet, "date": ""}
 
 
 # --- the attendance routine ---------------------------------------------
@@ -242,3 +276,121 @@ def test_every_routine_produces_items_the_ledger_can_tell_apart(ledger):
             assert isinstance(item, Due)
             assert item.fingerprint not in seen
             seen.add(item.fingerprint)
+
+
+# --- the mail watch ------------------------------------------------------
+
+
+def test_a_new_email_is_raised_once_and_then_never_again(ledger, inbox):
+    now = at(SUNDAY, "11:00")
+    ledger(now=now)
+    inbox(mail("18f", sender="dana@impact.co.il", subject="לוח משמרות"))
+
+    first = proactive.new_mail(now)
+    assert len(first) == 1
+    assert first[0].fingerprint == "mail:18f"
+    assert "dana@impact.co.il" in first[0].text
+    assert "לוח משמרות" in first[0].text
+    # The id travels in the message so his "כן" has something to act on.
+    assert "[id:18f]" in first[0].text
+
+    # Same mail still unread on the next tick five minutes later.
+    assert proactive.new_mail(at(SUNDAY, "11:05")) == []
+
+
+def test_the_mail_watch_claims_before_it_decides(ledger, inbox):
+    # A mail item is claimed inside the routine rather than by the tick, so it
+    # arrives already claimed and the tick must not claim it a second time.
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    inbox(mail("aa"))
+    due = proactive.new_mail(now)
+    assert due[0].preclaimed is True
+    assert fake.claimed == {"mail:aa"}
+
+
+def test_mail_held_by_a_shut_window_is_released_not_swallowed(ledger, inbox):
+    # The dangerous case: claimed by the routine, then never sent. Without the
+    # release the email is marked told-about while Itai has heard nothing.
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now, wrote_at=now - timedelta(hours=30))
+    inbox(mail("bb"))
+
+    summary = proactive.run_tick(send=Outbox(), now=now)
+    assert summary["held"] == ["mail:bb"]
+    assert fake.released == ["mail:bb"]
+    assert fake.claimed == set()
+
+    # He writes; the window reopens; the email still goes out.
+    later = at(SUNDAY, "11:30")
+    fake.wrote_at = later
+    out = Outbox()
+    proactive.run_tick(send=out, now=later)
+    assert len(out.sent) == 1
+
+
+def test_a_burst_of_mail_is_spread_over_ticks_rather_than_dumped(ledger, inbox):
+    now = at(SUNDAY, "11:00")
+    ledger(now=now)
+    inbox(*[mail(f"m{i}") for i in range(8)])
+
+    first = proactive.new_mail(now)
+    assert len(first) == proactive.MAIL_PER_TICK
+    # The rest are not lost - they are simply still unread on the next tick.
+    second = proactive.new_mail(at(SUNDAY, "11:05"))
+    assert len(second) == 8 - proactive.MAIL_PER_TICK
+    assert not {i.fingerprint for i in first} & {i.fingerprint for i in second}
+
+
+def test_the_mail_watch_is_quiet_at_night(ledger, inbox):
+    ledger(now=at(SUNDAY, "03:00"))
+    inbox(mail("cc"))
+    assert proactive.new_mail(at(SUNDAY, "03:00")) == []
+    assert proactive.new_mail(at(SUNDAY, "23:40")) == []
+    # And speaks again in the morning - the email was not consumed overnight.
+    assert len(proactive.new_mail(at(SUNDAY, "07:30"))) == 1
+
+
+def test_the_mail_watch_works_on_days_the_attendance_reminder_does_not(ledger, inbox):
+    # Mail is not tied to the work week; Friday is a working day for the inbox.
+    now = at(FRIDAY, "11:00")
+    ledger(now=now)
+    inbox(mail("dd"))
+    out = Outbox()
+    summary = proactive.run_tick(send=out, now=now)
+    assert summary["sent"] == ["mail:dd"]
+
+
+def test_a_proactive_message_is_written_into_the_conversation(ledger, inbox):
+    # Otherwise his reply lands on a model with no record of the question.
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    inbox(mail("ee"))
+    out = Outbox()
+    proactive.run_tick(send=out, now=now)
+    assert len(fake.turns) == 1
+    sender, text = fake.turns[0]
+    assert sender == "972500000000"
+    assert text == out.sent[0][1]
+
+
+def test_a_message_that_never_left_is_not_written_into_the_conversation(ledger, inbox):
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    inbox(mail("ff"))
+    proactive.run_tick(send=Outbox(ok=False), now=now)
+    assert fake.turns == []
+
+
+def test_gmail_falling_over_does_not_stop_the_attendance_reminder(ledger, monkeypatch):
+    now = at(SUNDAY, "08:55")
+    ledger(now=now)
+    import gmail_tools
+
+    def broken(query="", max_results=10):
+        raise RuntimeError("Gmail is having a bad day")
+
+    monkeypatch.setattr(gmail_tools, "list_inbox_messages", broken)
+    out = Outbox()
+    summary = proactive.run_tick(send=out, now=now)
+    assert summary["sent"] == [f"attendance:in:{SUNDAY}"]

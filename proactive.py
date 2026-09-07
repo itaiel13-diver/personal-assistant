@@ -67,10 +67,16 @@ class Due:
 
     fingerprint must be stable for the same real-world item and different for a
     different one - a date for a daily reminder, a message id for an email.
+
+    preclaimed is for a routine that had to claim before it could decide - the
+    mail watch claims a message id so it does not look at the same email on
+    every tick, and by then the claim is already made. run_tick then skips the
+    claim but still gives it back if the message does not go out.
     """
     fingerprint: str
     kind: str
     text: str
+    preclaimed: bool = False
 
 
 def _slot(now: datetime, at: time) -> datetime:
@@ -123,7 +129,72 @@ def attendance(now: datetime) -> list:
     return due
 
 
-ROUTINES = (attendance,)
+# --- new mail ------------------------------------------------------------
+#
+# The half of "active" that Itai described as reading his mail by itself. It
+# does so without a single model call, and that is a hard constraint rather
+# than a preference: the Gemini free tier allows twenty generate_content
+# requests a day - production has already hit that ceiling and answered him
+# with an error - so every one of them belongs to a question he actually
+# asked. A routine that spent one judging an email would take an answer away
+# from him to do it.
+#
+# So the assistant notices for free and asks. He decides whether it is worth
+# reading, and only then does a model call happen, on his instruction, the way
+# every other model call in this project does.
+
+# category:primary is Gmail's own classification, which already keeps
+# promotions, social and bulk updates out - a filter that would otherwise have
+# to be invented, badly, here.
+MAIL_QUERY = "is:unread in:inbox category:primary newer_than:1d"
+
+# A cap per tick, not per day. It only exists so that the first tick after a
+# quiet weekend does not arrive as twenty messages at once; the rest follow on
+# the next tick a few minutes later.
+MAIL_PER_TICK = 5
+
+# Mail arriving at 03:00 is read at 07:00 either way. Reminders are pinned to
+# the working day, and this keeps the mail watch there too.
+WAKING_START = time(7, 0)
+WAKING_END = time(22, 30)
+
+
+def _mail_text(message: dict) -> str:
+    subject = message.get("subject") or "(ללא נושא)"
+    lines = ["📬 *מייל חדש*", f"מאת: {message.get('sender', '')}", f"נושא: {subject}"]
+    snippet = (message.get("snippet") or "")[:280]
+    if snippet:
+        lines += ["", snippet]
+    # The id is printed in the same [id:...] form search_emails uses, so when
+    # Itai answers, the model finds it in its own history and can go straight
+    # to read_email instead of searching the mailbox again.
+    lines += ["", f'רוצה שאקרא ואסכם? תגיד לי [id:{message.get("id")}]']
+    return "\n".join(lines)
+
+
+def new_mail(now: datetime) -> list:
+    """Raises unread mail Itai has not been told about yet, one message each."""
+    if not (WAKING_START <= now.time() <= WAKING_END):
+        return []
+
+    # Imported here rather than at module scope: this pulls in the Google API
+    # client, and the heartbeat framework should stay importable without it.
+    from gmail_tools import list_inbox_messages
+
+    due = []
+    for message in list_inbox_messages(MAIL_QUERY, max_results=10):
+        if len(due) >= MAIL_PER_TICK:
+            break
+        fingerprint = f"mail:{message['id']}"
+        # Claimed here, before the decision, so an email that has already been
+        # raised is not looked at again on every tick for the rest of the day.
+        if not storage.claim(fingerprint, "mail"):
+            continue
+        due.append(Due(fingerprint, "mail", _mail_text(message), preclaimed=True))
+    return due
+
+
+ROUTINES = (attendance, new_mail)
 
 
 # --- the tick ------------------------------------------------------------
@@ -158,6 +229,16 @@ def collect(now: datetime, routines=ROUTINES) -> list:
     return items
 
 
+def _hold(items) -> list:
+    """Nothing goes out this tick. Anything a routine claimed on its own has to
+    go back, or an email claimed while the window was shut would be marked as
+    told-about without ever having been told."""
+    for item in items:
+        if item.preclaimed:
+            storage.release(item.fingerprint)
+    return [i.fingerprint for i in items]
+
+
 def run_tick(send, now=None, routines=ROUTINES) -> dict:
     """One heartbeat. Returns a summary the caller can log or return as JSON.
 
@@ -181,7 +262,7 @@ def run_tick(send, now=None, routines=ROUTINES) -> dict:
         # Nothing to send to. This only happens on a service that has never
         # received a message and has no OWNER_PHONE set.
         logger.error("Proactive tick has something to say and nobody to say it to.")
-        summary["held"] = [i.fingerprint for i in items]
+        summary["held"] = _hold(items)
         return summary
 
     if window == "closed":
@@ -189,14 +270,20 @@ def run_tick(send, now=None, routines=ROUTINES) -> dict:
         # instruction. Reported here so the reason is visible rather than
         # looking like the reminder simply never ran.
         logger.warning("24h WhatsApp window closed — %d proactive item(s) held.", len(items))
-        summary["held"] = [i.fingerprint for i in items]
+        summary["held"] = _hold(items)
         return summary
 
     for item in items:
-        if not storage.claim(item.fingerprint, item.kind):
+        if not item.preclaimed and not storage.claim(item.fingerprint, item.kind):
             continue
         if send(number, item.text):
             summary["sent"].append(item.fingerprint)
+            # Written into the conversation as a turn the assistant took, so
+            # that "כן, תקרא" a minute later lands on a model that can see what
+            # it just said. A proactive message missing from the history is one
+            # the assistant has no memory of sending, and the reply to it
+            # arrives as a non sequitur.
+            storage.append_model_turn(number, item.text)
         else:
             # The message never left. Give the claim back so the next tick can
             # try again while the item is still inside its grace window.

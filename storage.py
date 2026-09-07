@@ -348,3 +348,17 @@ def last_inbound():
     except Exception as e:
         logger.error(f"Failed to read the last inbound message: {e}")
         return (None, None)
+
+
+def append_model_turn(sender_id: str, text: str) -> None:
+    """Writes a message the assistant sent on its own into the conversation.
+
+    A proactive message is a turn Itai can reply to - "כן, תקרא" only means
+    anything if the model can see what it just said. Without this the model
+    receives an answer to a question it has no record of asking.
+    """
+    if not enabled():
+        return
+    history = load_history(sender_id)
+    history.append({"role": "model", "parts": [{"text": text}]})
+    save_history(sender_id, history)

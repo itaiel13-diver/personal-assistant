@@ -322,3 +322,41 @@ def search_email_attachment(message_id: str, filename: str, keywords: str,
     except Exception as e:
         logger.error(f"Gmail attachment search failed: {e}")
         return f"❌ שגיאה בחיפוש בקובץ המצורף: {e}"
+
+
+def list_inbox_messages(query: str = "is:unread in:inbox", max_results: int = 10) -> list:
+    """Returns matching messages as dicts, for code rather than for the model.
+
+    search_emails above formats one string for Gemini to read. The proactive
+    side needs the same information in parts - it decides on the message id,
+    prints the sender and subject itself, and never involves the model at all,
+    because the Gemini free tier allows twenty requests a day and they belong
+    to Itai's actual questions.
+
+    Returns [] on any failure. A proactive routine that cannot reach Gmail must
+    fall silent, not raise into the heartbeat.
+    """
+    try:
+        service = _gmail_service()
+        listing = service.users().messages().list(
+            userId="me", q=query, maxResults=max_results
+        ).execute()
+
+        found = []
+        for ref in listing.get("messages", []):
+            msg = service.users().messages().get(
+                userId="me", id=ref["id"], format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            ).execute()
+            found.append({
+                "id": ref["id"],
+                "sender": _header(msg, "From"),
+                "subject": _header(msg, "Subject"),
+                "date": _header(msg, "Date"),
+                # Gmail's own one-line preview, free with the metadata call.
+                "snippet": (msg.get("snippet") or "").strip(),
+            })
+        return found
+    except Exception as e:
+        logger.error(f"Gmail inbox listing failed: {e}")
+        return []

@@ -4,28 +4,31 @@ import os
 from email.message import EmailMessage
 
 import attachment_readers
+import google_scopes
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
-# readonly + compose.
+# One token serves mail, Drive, the editors, calendar, tasks and contacts, so
+# the list it carries lives in google_scopes and not here. As of 2026-09-07 the
+# mail half of it is https://mail.google.com/ - full mailbox access.
 #
-# IMPORTANT, and verified the hard way against the live API: gmail.compose DOES
-# allow sending - drafts().send() succeeds with this scope. An earlier version of
-# this comment claimed the opposite and it was wrong. There is no Gmail scope that
-# grants draft creation without also granting the ability to send.
+# IMPORTANT, and verified the hard way against the live API: that changes less
+# than it looks. The scope it replaced, gmail.compose, DOES allow sending -
+# drafts().send() succeeds with it. An earlier version of this comment claimed
+# otherwise and was wrong; there is no Gmail scope that grants draft creation
+# without also granting the ability to send.
 #
-# So the "never send by itself" guarantee does NOT come from the token. It comes
-# from this module exposing no sending function at all: the assistant is given
-# create_email_draft and nothing else, and drafts().send() is never called
-# anywhere in this codebase. Adding such a call would silently remove the only
-# thing standing between the model and a real outgoing email.
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose",
-]
+# So the "never sends by itself" guarantee has never come from the token, under
+# either scope. It comes from this module exposing no sending function at all:
+# the assistant is given create_email_draft and nothing else, and drafts().send()
+# is called nowhere in this codebase. That is the only thing standing between
+# the model and a real outgoing email, and test_module_exposes_no_way_to_send_mail
+# is the only thing standing behind it. Widening the scope made both more
+# load-bearing, not less. Do not relax either to make a feature fit.
+SCOPES = google_scopes.SCOPES
 
 CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")

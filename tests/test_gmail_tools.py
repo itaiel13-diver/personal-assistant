@@ -29,13 +29,21 @@ def test_module_exposes_no_way_to_send_mail():
     assert not any("send" in n.lower() for n in public), f"a sending function is exposed: {public}"
 
 
-def test_scopes_are_limited_to_read_and_compose():
-    """Broader scopes (gmail.modify, full mail.google.com) would also allow
-    deleting mail and changing labels, which the assistant has no reason to do."""
-    assert sorted(gmail_tools.SCOPES) == sorted([
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.compose",
-    ])
+def test_the_mail_scope_is_the_shared_one_and_is_openly_wide():
+    """This test used to assert the mail scopes were narrow. They are not, since
+    2026-09-07: one consent mints one token for every Google API the assistant
+    touches, and the mail half of it is now full mailbox access.
+
+    What it checks instead is the pair of things that actually matter. That this
+    module presents the very list the consent script asked for - a copy that
+    drifts never fails at import, it fails in production as an opaque 403. And
+    that the list is openly the wide one, so nobody reads a reassuring test name
+    and believes the token is holding a line it stopped holding. That line is
+    held by test_module_exposes_no_way_to_send_mail, directly above."""
+    import google_scopes
+
+    assert gmail_tools.SCOPES is google_scopes.SCOPES
+    assert "https://mail.google.com/" in gmail_tools.SCOPES
 
 
 def test_extract_body_finds_plain_text_nested_in_multipart():

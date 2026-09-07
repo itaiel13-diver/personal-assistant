@@ -124,12 +124,23 @@ def test_every_new_file_is_created_inside_the_working_folder():
 
 
 def test_scopes_are_the_ones_the_refresh_token_script_asks_for():
-    """One consent mints one token. If these two lists drift apart, the token in
-    production stops carrying what this module presents, and the failure appears
-    at runtime as an opaque 403."""
-    script = open("scripts/get_gmail_refresh_token.py", encoding="utf-8").read()
-    for scope in drive_tools.SCOPES:
-        assert scope in script, f"{scope} is missing from the refresh-token script"
+    """One consent mints one token, and each new consent supersedes the last. If
+    the list this module presents and the list the script asks for drift apart,
+    nothing fails at import - it fails in production as an opaque 403 on a call
+    that worked yesterday.
+
+    This used to be checked by grepping the script's source for each scope
+    string, which was true only for as long as somebody kept three copies of the
+    list in step by hand. There is one list now, in google_scopes, and both ends
+    are the same object - so the drift this test was written for cannot happen
+    rather than being detected after the fact. What is left to check is that
+    neither end has quietly gone back to a private copy."""
+    import google_scopes
+    import scripts.get_gmail_refresh_token as mint
+
+    assert drive_tools.SCOPES is google_scopes.SCOPES
+    assert mint.SCOPES is google_scopes.SCOPES
+    assert "https://www.googleapis.com/auth/drive" in drive_tools.SCOPES
 
 
 # --- Searching ---

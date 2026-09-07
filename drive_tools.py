@@ -51,6 +51,7 @@ import logging
 import os
 
 import attachment_readers
+import google_scopes
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -58,14 +59,11 @@ from googleapiclient.http import MediaIoBaseUpload
 
 logger = logging.getLogger(__name__)
 
-# Full drive, for the reason set out above. Kept next to the Gmail scopes
-# because one refresh token now carries all of them - re-consenting for Drive
-# alone would have invalidated mail access.
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/drive",
-]
+# Full drive, for the reason set out above, and everything else the one refresh
+# token carries - the whole list lives in google_scopes, because a token is
+# minted once for all of it and re-consenting for any single API would
+# invalidate access to the rest.
+SCOPES = google_scopes.SCOPES
 
 CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")

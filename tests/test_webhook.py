@@ -260,3 +260,60 @@ def test_every_chunk_of_a_long_reply_is_actually_sent():
     bodies = [c.kwargs["json"]["text"]["body"] for c in requests_mock.post.call_args_list]
     assert all(b.startswith("(") for b in bodies), "numbering is missing"
     assert all(len(b) <= webhook_server.WHATSAPP_MAX_BODY for b in bodies)
+
+
+# --- the heartbeat -------------------------------------------------------
+#
+# /tick is the only route that makes the assistant speak without being spoken
+# to, so who may press it matters more than what it does.
+
+
+def test_the_tick_endpoint_does_not_exist_until_a_secret_is_configured(client):
+    with patch.object(webhook_server, "TICK_SECRET", ""):
+        assert client.get("/tick").status_code == 404
+
+
+def test_the_tick_endpoint_refuses_a_wrong_secret(client):
+    with patch.object(webhook_server, "TICK_SECRET", "the-real-secret"):
+        assert client.get("/tick?key=guess").status_code == 403
+        assert client.get("/tick").status_code == 403
+        assert client.get("/tick", headers={"X-Tick-Secret": "guess"}).status_code == 403
+
+
+def test_the_tick_endpoint_runs_a_pass_for_the_right_secret(client):
+    with patch.object(webhook_server, "TICK_SECRET", "the-real-secret"), \
+            patch.object(webhook_server.proactive, "run_tick") as run_tick:
+        run_tick.return_value = {"due": 0, "sent": []}
+
+        by_header = client.get("/tick", headers={"X-Tick-Secret": "the-real-secret"})
+        by_query = client.get("/tick?key=the-real-secret")
+
+    assert by_header.status_code == 200
+    assert by_query.status_code == 200
+    assert run_tick.call_count == 2
+
+
+def test_a_failing_tick_still_answers_the_pinger(client):
+    # A free pinger that sees repeated failures may stop calling, and a pinger
+    # that has stopped ends every proactive routine silently. The tick reports
+    # its own failure with a 200 rather than risk that.
+    with patch.object(webhook_server, "TICK_SECRET", "the-real-secret"), \
+            patch.object(webhook_server.proactive, "run_tick",
+                         side_effect=RuntimeError("boom")):
+        r = client.get("/tick?key=the-real-secret")
+    assert r.status_code == 200
+    assert r.get_json() == {"ok": False}
+
+
+def test_an_incoming_message_reopens_the_free_window(client):
+    # The 24-hour window is measured from Itai's last message and nothing else
+    # records it. Miss this and every proactive reminder is held forever.
+    payload = _text_message_payload("972500000000", "מה יש לי היום")
+    raw = json.dumps(payload).encode("utf-8")
+    with patch.object(webhook_server, "handle_whatsapp_message", return_value="בסדר"), \
+            patch.object(webhook_server, "_send_whatsapp_reply"), \
+            patch.object(webhook_server.storage, "note_inbound") as note:
+        client.post("/webhook", data=raw,
+                    headers={"X-Hub-Signature-256": _sign(raw),
+                             "Content-Type": "application/json"})
+    note.assert_called_once_with("972500000000")

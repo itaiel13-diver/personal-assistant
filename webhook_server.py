@@ -4,9 +4,11 @@ import logging
 import os
 
 import requests
-from flask import Flask, Response, abort, request
+from flask import Flask, Response, abort, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+import proactive
+import storage
 from assistant import handle_whatsapp_message
 
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +25,10 @@ META_APP_SECRET = os.environ.get("META_APP_SECRET")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v21.0")
+# The shared secret an external pinger presents to /tick. Unset, the
+# endpoint does not exist at all - an unguarded /tick is a stranger's
+# button for making the assistant message Itai.
+TICK_SECRET = os.environ.get("TICK_SECRET", "")
 
 
 def _is_valid_meta_signature(req) -> bool:
@@ -78,10 +84,14 @@ def _split_for_whatsapp(text: str, limit: int = WHATSAPP_MAX_BODY) -> list:
 def _send_whatsapp_reply(to: str, text: str) -> None:
     """Sends a message back via the WhatsApp Cloud API.
     Unlike Twilio, Meta has no synchronous webhook-response reply - a reply
-    is always a separate, explicit outbound call to the Graph API."""
+    is always a separate, explicit outbound call to the Graph API.
+
+    Returns True when every part was accepted. A reply to an incoming message
+    ignores that, but a proactive send needs it: an item whose message never
+    left has to be un-claimed so the next tick can try again."""
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         logger.error("WHATSAPP_TOKEN/PHONE_NUMBER_ID not set — cannot send reply.")
-        return
+        return False
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     parts = _split_for_whatsapp(text)
@@ -98,10 +108,11 @@ def _send_whatsapp_reply(to: str, text: str) -> None:
             r = requests.post(url, headers=headers, json=payload, timeout=15)
             if r.status_code >= 400:
                 logger.error(f"WhatsApp send failed: {r.status_code} {r.text}")
-                return
+                return False
         except requests.RequestException as e:
             logger.error(f"WhatsApp send raised an exception: {e}")
-            return
+            return False
+    return bool(parts)
 
 
 def _extract_incoming_message(payload: dict):
@@ -146,6 +157,12 @@ def receive_webhook():
     payload = request.get_json(silent=True) or {}
     sender, text, message_type = _extract_incoming_message(payload)
 
+    if sender:
+        # Itai writing is what reopens WhatsApp's 24-hour window, and the
+        # proactive side has no other way to know when that happened. Recorded
+        # for any message type - an unsupported voice note reopens it too.
+        storage.note_inbound(sender)
+
     if sender and message_type == "text" and text:
         reply_text = handle_whatsapp_message(text.strip(), sender_id=sender)
         _send_whatsapp_reply(sender, reply_text)
@@ -160,6 +177,43 @@ def receive_webhook():
     # Meta requires a fast 2xx regardless of content; a non-2xx (or a slow
     # response) makes it retry, and repeated failures can disable the webhook.
     return "OK", 200
+
+
+def _tick_is_authorised(req) -> bool:
+    """The pinger proves itself with a shared secret, by header or query string.
+    The header is preferred - a query string ends up in access logs."""
+    provided = req.headers.get("X-Tick-Secret") or req.args.get("key", "")
+    return hmac.compare_digest(provided, TICK_SECRET)
+
+
+@app.route("/tick", methods=["GET", "POST"])
+def tick():
+    """The assistant's heartbeat, called from outside every few minutes.
+
+    Render's free plan sleeps the instance after about fifteen minutes, so this
+    request does two jobs: it wakes the service, and it gives the proactive
+    routines their only chance to look at the clock. It is deliberately cheap -
+    on the overwhelming majority of calls nothing is due and it returns
+    immediately.
+    """
+    if not TICK_SECRET:
+        # Not configured: behave as though the route was never added, rather
+        # than advertise an endpoint that anyone may press.
+        abort(404)
+    if not _tick_is_authorised(request):
+        abort(403)
+
+    try:
+        summary = proactive.run_tick(send=_send_whatsapp_reply)
+    except Exception:
+        # A crash here would make the pinger see failures and, on some free
+        # services, stop calling - which silently ends every routine.
+        logger.exception("Proactive tick failed.")
+        return jsonify({"ok": False}), 200
+
+    if summary.get("due"):
+        logger.info(f"Proactive tick: {summary}")
+    return jsonify(summary), 200
 
 
 # Google's OAuth consent screen requires a home page, a privacy policy and

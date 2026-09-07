@@ -129,6 +129,28 @@ def _ensure_schema(conn) -> None:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
         """)
+        # Every message the assistant sends on its own initiative is recorded
+        # here before it goes out, keyed by a fingerprint the routine builds
+        # from the thing being raised (a date for a shift reminder, a message
+        # id for an email). The primary key is the whole mechanism: a second
+        # attempt to raise the same thing fails to insert and is dropped.
+        # Without it the heartbeat repeats itself every few minutes, which is
+        # how a proactive assistant turns into a broken one.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS proactive_log (
+                fingerprint TEXT PRIMARY KEY,
+                kind        TEXT NOT NULL,
+                sent_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        # WhatsApp only allows a free-form business message within 24 hours of
+        # the person's own last message, and that clock is what decides whether
+        # a reminder can be delivered at all. conversations.updated_at cannot
+        # answer it - it moves when the assistant writes back too - so the
+        # moment Itai wrote gets its own column.
+        cur.execute(
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMPTZ"
+        )
     conn.commit()
     _schema_ready = True
 
@@ -203,3 +225,126 @@ def save_memory(key: str, value: str, category: str = "general") -> None:
     except Exception as e:
         logger.error(f"Failed to save memory item {key}: {e}")
         raise
+
+
+# --- the proactive side -------------------------------------------------
+#
+# Everything below is read and written by the heartbeat rather than by a
+# conversation, so all of it fails soft: a database that is down must make the
+# assistant quiet, never make it crash the endpoint that woke it.
+
+
+def claim(fingerprint: str, kind: str) -> bool:
+    """Reserves the right to send one proactive message, exactly once, ever.
+
+    Returns True only for the caller that inserted the row. The claim happens
+    BEFORE the message is sent, so two overlapping ticks cannot both decide to
+    remind Itai of the same shift; if the send then fails, the caller calls
+    release() to put it back. Any database error returns False - not sending is
+    the safe direction when we cannot tell whether we already sent.
+    """
+    if not enabled():
+        # No ledger means no way to promise "only once", and sending twice is
+        # worse than not sending. Silence is the safe failure here.
+        return False
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO proactive_log (fingerprint, kind)
+                    VALUES (%s, %s)
+                    ON CONFLICT (fingerprint) DO NOTHING
+                    """,
+                    (fingerprint, kind),
+                )
+                claimed = cur.rowcount == 1
+            conn.commit()
+        return claimed
+    except Exception as e:
+        logger.error(f"Failed to claim proactive item {fingerprint}: {e}")
+        return False
+
+
+def release(fingerprint: str) -> None:
+    """Undoes a claim whose message never actually went out, so the next tick
+    may try again while the item is still worth raising."""
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM proactive_log WHERE fingerprint = %s", (fingerprint,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to release proactive item {fingerprint}: {e}")
+
+
+def prune_proactive_log(days: int = 60) -> None:
+    """The ledger only has to remember long enough to stop a repeat. Rows older
+    than that are dead weight on a free database with a 1GB ceiling."""
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM proactive_log WHERE sent_at < now() - make_interval(days => %s)",
+                    (days,),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to prune the proactive log: {e}")
+
+
+def note_inbound(sender_id: str) -> None:
+    """Records that Itai wrote, which is what reopens the 24-hour window.
+
+    Called for every incoming message, including ones the assistant cannot
+    answer - an unsupported voice note still reopens the window as far as
+    WhatsApp is concerned.
+    """
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO conversations (sender_id, history, last_inbound_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (sender_id) DO UPDATE SET last_inbound_at = now()
+                    """,
+                    (sender_id, json.dumps([])),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to note an inbound message from {sender_id}: {e}")
+
+
+def last_inbound():
+    """Returns (sender_id, last_inbound_at) for whoever wrote most recently, or
+    (None, None). This is how a tick finds Itai's number without one being
+    configured, and how it knows whether the free window is still open."""
+    if not enabled():
+        return (None, None)
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT sender_id, last_inbound_at FROM conversations
+                    WHERE last_inbound_at IS NOT NULL
+                    ORDER BY last_inbound_at DESC LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    except Exception as e:
+        logger.error(f"Failed to read the last inbound message: {e}")
+        return (None, None)

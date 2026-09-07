@@ -86,9 +86,26 @@ def _status_update_payload() -> dict:
 
 
 def test_health_check(client):
+    # Render's health check only needs a 2xx here. The body is now the home
+    # page Google's OAuth consent screen points at, so it is HTML, not "OK".
     r = client.get("/")
     assert r.status_code == 200
-    assert r.data == b"OK"
+
+
+def test_the_consent_screen_pages_are_served(client):
+    # Google requires the home page, the privacy policy and the terms to
+    # resolve on a domain we control. If one of these 404s, the OAuth consent
+    # screen cannot be published and the refresh token goes back to expiring
+    # every seven days.
+    for path in ("/", "/privacy", "/terms"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert b"<!doctype html>" in r.data, path
+
+    body = client.get("/privacy").data.decode("utf-8")
+    # The Limited Use wording is what Google checks the policy for.
+    assert "Limited Use" in body
+    assert "itaiel13@gmail.com" in body
 
 
 def test_verify_webhook_success(client):

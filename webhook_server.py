@@ -162,9 +162,97 @@ def receive_webhook():
     return "OK", 200
 
 
+# Google's OAuth consent screen requires a home page, a privacy policy and
+# terms of service, each on a domain registered under "Authorized domains".
+# The Render service is the only domain we actually control, so the three
+# pages are served from here rather than invented somewhere else. They are
+# static text: no data is collected by them, and no template engine is used.
+
+_PAGE = """<!doctype html>
+<html lang="he" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+body{{font-family:system-ui,-apple-system,"Segoe UI",Arial,sans-serif;
+max-width:44rem;margin:0 auto;padding:2rem 1.25rem;line-height:1.7;
+color:#1c1a17;background:#fbfaf8}}
+h1{{font-size:1.6rem;margin:0 0 .25rem}}
+p.sub{{color:#6b645c;margin:0 0 2rem}}
+h2{{font-size:1.05rem;margin:2rem 0 .5rem}}
+a{{color:#8a5a2b}}
+</style></head><body>
+<h1>{title}</h1><p class="sub">{sub}</p>{body}</body></html>"""
+
+
 @app.route("/", methods=["GET"])
 def health_check():
-    return "OK", 200
+    # Render's health check hits this path; it only needs a 2xx.
+    return _PAGE.format(
+        title="עוזר אישי",
+        sub="Personal Assistant \u2014 a private WhatsApp assistant, single user",
+        body="""
+<p>שירות פרטי המחבר את WhatsApp לחשבון Google של בעליו היחיד, כדי לקרוא
+ולסכם דואר, קבצים, יומן ומשימות עבורו בלבד.</p>
+<p>This is a private, single-user service. It connects one person's WhatsApp
+to that same person's own Google account so they can read and organise their
+own mail, files, calendar and tasks. It is not offered to other users.</p>
+<p><a href="/privacy">Privacy policy</a> &middot;
+<a href="/terms">Terms of service</a></p>""",
+    ), 200
+
+
+@app.route("/privacy", methods=["GET"])
+def privacy_policy():
+    return _PAGE.format(
+        title="מדיניות פרטיות / Privacy policy",
+        sub="Last updated 2026-09-07",
+        body="""
+<h2>מי מפעיל את השירות</h2>
+<p>שירות פרטי בהפעלת אדם יחיד, עבור חשבון Google אחד \u2014 שלו. אין משתמשים
+אחרים ואין הרשמה.</p>
+<h2>איזה מידע נאסף</h2>
+<p>הודעות WhatsApp שהבעלים שולח לשירות, ומידע מחשבון Google שלו (דואר,
+קבצים ב-Drive, יומן, אנשי קשר ומשימות) \u2014 רק כשהוא מבקש זאת מפורשות
+בהודעה.</p>
+<h2>מה נעשה במידע</h2>
+<p>המידע משמש אך ורק כדי לענות לבעלים באותה שיחה. הוא אינו נמכר, אינו מושכר
+ואינו משותף עם צד שלישי, למעט ספקי התשתית שהשירות רץ עליהם (Render,
+Anthropic, Meta WhatsApp Business API) לצורך אספקת התשובה עצמה.</p>
+<h2>שמירה ומחיקה</h2>
+<p>היסטוריית השיחה נשמרת בבסיס נתונים פרטי של הבעלים. הבעלים יכול למחוק
+אותה בכל רגע, ולבטל את גישת השירות לחשבון Google שלו בכל רגע בכתובת
+<a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</p>
+<h2>Google user data</h2>
+<p>The service's use of information received from Google APIs adheres to the
+<a href="https://developers.google.com/terms/api-services-user-data-policy">Google
+API Services User Data Policy</a>, including the Limited Use requirements.
+Data from Google APIs is used only to answer the owner's own requests, is
+never transferred to anyone except as needed to provide that answer, is never
+used for advertising, and is never read by a human other than the owner.</p>
+<h2>יצירת קשר / Contact</h2>
+<p>itaiel13@gmail.com</p>""",
+    ), 200
+
+
+@app.route("/terms", methods=["GET"])
+def terms_of_service():
+    return _PAGE.format(
+        title="תנאי שימוש / Terms of service",
+        sub="Last updated 2026-09-07",
+        body="""
+<h2>למי השירות מיועד</h2>
+<p>השירות פרטי ומיועד לבעליו בלבד. אין הרשאה לאדם אחר להשתמש בו.</p>
+<h2>אין אחריות</h2>
+<p>השירות ניתן כפי שהוא (AS IS), ללא אחריות מכל סוג. תשובות נוצרות על ידי
+מודל שפה ועלולות להיות שגויות; אין להסתמך עליהן לצורך החלטה משפטית, רפואית
+או פיננסית.</p>
+<h2>הגבלת אחריות</h2>
+<p>המפעיל אינו נושא באחריות לכל נזק הנובע משימוש בשירות.</p>
+<h2>שינוי והפסקה</h2>
+<p>המפעיל רשאי לשנות או להפסיק את השירות בכל עת וללא הודעה מוקדמת.</p>
+<h2>יצירת קשר / Contact</h2>
+<p>itaiel13@gmail.com</p>""",
+    ), 200
 
 
 if __name__ == "__main__":

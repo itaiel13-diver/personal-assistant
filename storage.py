@@ -170,6 +170,24 @@ def _ensure_schema(conn) -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS reminders_due ON reminders (status, due_at)"
         )
+        # A refresh token the assistant holds on Itai's behalf for a provider
+        # that rotates it. Microsoft is the reason this table exists: it hands
+        # back a NEW refresh token every time the old one is redeemed, so the
+        # value in an environment variable is stale from the first refresh
+        # onwards and cannot be the live copy. The env var is only ever a seed.
+        #
+        # Deliberately NOT the memory table. Everything in `memory` is rendered
+        # into the model's system instruction on every single message by
+        # assistant._load_memory_context - a credential there would be shown to
+        # the model, and through it to whoever is talking to the model, on every
+        # turn. Nothing secret goes in that table, ever.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_tokens (
+                provider      TEXT PRIMARY KEY,
+                refresh_token TEXT NOT NULL,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
     conn.commit()
     _schema_ready = True
 
@@ -244,6 +262,67 @@ def save_memory(key: str, value: str, category: str = "general") -> None:
     except Exception as e:
         logger.error(f"Failed to save memory item {key}: {e}")
         raise
+
+
+# --- rotating OAuth refresh tokens --------------------------------------
+#
+# See the oauth_tokens comment in _ensure_schema for why these are not stored
+# in `memory` and must never be moved there.
+
+
+def load_token(provider: str) -> str:
+    """The live refresh token for a provider, or "" when there is none stored.
+
+    Fails soft on purpose: a database that is down should make the connection
+    fall back to its environment-variable seed and log, not raise inside a tool
+    call the model is waiting on.
+    """
+    if not enabled():
+        return ""
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT refresh_token FROM oauth_tokens WHERE provider = %s",
+                    (provider,),
+                )
+                row = cur.fetchone()
+        return row[0] if row else ""
+    except Exception as e:
+        logger.error(f"Failed to load refresh token for {provider}: {e}")
+        return ""
+
+
+def save_token(provider: str, refresh_token: str) -> bool:
+    """Records the newest refresh token for a provider. Returns whether it stuck.
+
+    The caller needs the answer rather than an exception: with Microsoft, a
+    token that was redeemed but not stored is a token that will be lost the
+    moment the previous one is finally revoked, and the only useful response is
+    to say so out loud while the old one still works.
+    """
+    if not (enabled() and refresh_token):
+        return False
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO oauth_tokens (provider, refresh_token, updated_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (provider)
+                    DO UPDATE SET refresh_token = EXCLUDED.refresh_token,
+                                  updated_at = now()
+                    """,
+                    (provider, refresh_token),
+                )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save refresh token for {provider}: {e}")
+        return False
 
 
 # --- the proactive side -------------------------------------------------

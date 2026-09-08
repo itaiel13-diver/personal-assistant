@@ -38,6 +38,20 @@ from drive_tools import (
     trash_drive_file,
     update_drive_file,
 )
+from todo_tools import (
+    add_todo_checklist_item,
+    complete_todo_task,
+    create_todo_list,
+    create_todo_task,
+    delete_todo_list,
+    delete_todo_task,
+    list_todo_lists,
+    list_todo_tasks,
+    reopen_todo_task,
+    search_todo_tasks,
+    todo_connection_status,
+    update_todo_task,
+)
 
 # הגדרת הלוגים למעקב
 logging.basicConfig(level=logging.INFO)
@@ -225,6 +239,26 @@ For a repeating reminder pass `repeat`: once, daily, weekdays (Sunday-Thursday),
 weekly or monthly. list_reminders shows what is armed; cancel_reminder takes an
 id from that list and cancels the whole series.
 
+MICROSOFT TO DO:
+Itai's task list, on his phone, outside this assistant. It is where a thing he
+has to DO belongs; a reminder is for interrupting him at a moment. When he asks
+you to remember a task rather than to nudge him at a time, prefer
+create_todo_task - and when he asks for both, do both, they are not the same
+thing.
+Lists and tasks are named, never numbered: pass the words he used and the tool
+resolves them. If it answers that a name matches more than one thing, ask him
+which - do not pick. Leave list_name empty for his default list unless he named
+one; search_todo_tasks finds a task when he does not know which list it is on.
+create_todo_task takes a due date and a reminder time in his own words, the same
+way create_reminder does, and the same repeat values.
+complete_todo_task is how a task ends. delete_todo_task is permanent and To Do
+has no bin for tasks, so only call it when he says to delete; the same goes for
+delete_todo_list, which takes every task on the list with it. If a To Do tool
+reports that Microsoft rejected the request, say so plainly - do not tell him a
+task was saved when the tool did not say it was.
+If the tools report the connection is not set up, tell him it needs one browser
+approval and offer to walk him through it; do not keep retrying.
+
 COMMUNICATION STYLE:
 - Natural, sharp, highly structured Israeli business Hebrew.
 - Use bolding (**text**) and bullet points for readability on mobile/while driving.
@@ -358,6 +392,18 @@ tools_list = [
     create_reminder,
     list_reminders,
     cancel_reminder,
+    list_todo_lists,
+    list_todo_tasks,
+    search_todo_tasks,
+    create_todo_task,
+    update_todo_task,
+    complete_todo_task,
+    reopen_todo_task,
+    delete_todo_task,
+    add_todo_checklist_item,
+    create_todo_list,
+    delete_todo_list,
+    todo_connection_status,
 ]
 
 

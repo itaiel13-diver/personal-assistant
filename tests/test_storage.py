@@ -128,3 +128,44 @@ def test_trimming_never_leaves_a_call_the_api_would_reject():
                 before = repaired[i - 1]
                 assert storage._is_response(before) or not storage._is_call(before), \
                     f"cut={cut}: call at {i} follows something the API rejects"
+
+
+# --- the rotating-token store -------------------------------------------
+#
+# Postgres is not reachable from the test environment, so what is checked here
+# is the behaviour with no database at all - which is also production's
+# behaviour whenever the database is down, and the path a Microsoft call takes
+# on a cold start before anything has been rotated.
+
+
+def test_no_database_means_no_stored_token(monkeypatch):
+    monkeypatch.setattr(storage, "DATABASE_URL", "")
+    assert storage.load_token("microsoft") == ""
+
+
+def test_a_token_cannot_be_stored_without_a_database(monkeypatch):
+    """Returning False rather than raising is what lets msgraph log the one
+    failure that otherwise surfaces days later as an unexplained invalid_grant."""
+    monkeypatch.setattr(storage, "DATABASE_URL", "")
+    assert storage.save_token("microsoft", "some-token") is False
+
+
+def test_an_empty_token_is_never_stored(monkeypatch):
+    """Overwriting a working refresh token with "" would end the connection,
+    and a provider that returns no new token on a refresh is normal."""
+    monkeypatch.setattr(storage, "DATABASE_URL", "postgres://nope")
+    called = []
+    monkeypatch.setattr(storage, "_connect", lambda: called.append(1))
+    assert storage.save_token("microsoft", "") is False
+    assert called == []
+
+
+def test_a_database_that_is_down_reads_as_no_token(monkeypatch):
+    monkeypatch.setattr(storage, "DATABASE_URL", "postgres://nope")
+
+    def broken():
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(storage, "_connect", broken)
+    assert storage.load_token("microsoft") == ""
+    assert storage.save_token("microsoft", "t") is False

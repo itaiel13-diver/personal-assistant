@@ -1,12 +1,17 @@
 """Google Drive for the assistant: reads widely, writes in one folder, can bin a file.
 
-Why this is OAuth as Itai and not the service account. The calendar works
-through a service account because a calendar can be *shared* with one. Drive
-cannot be made to work that way for what Itai asked for: a service account is a
+Why reads run as TWO identities. The main one is OAuth as Itai: "files shared
+with me" is only reachable by acting as him, because a service account is a
 separate Google identity with its own empty Drive, and a file somebody shared
-with itaiel13@gmail.com was not shared with it. "Files shared with me" is only
-reachable by acting as him, so this module reuses the Gmail OAuth client and its
-refresh token - the same consent, widened.
+with itaiel13@gmail.com was not shared with it. So this module reuses the
+Gmail OAuth client and its refresh token - the same consent, widened.
+
+The second identity is the bot itself. A file Itai shares directly with the
+bot's own address - the calendar's service account - is invisible to his
+token for exactly the reason above, in reverse. Those are read as the service
+account, read-only, and only after his identity has missed: see the section
+near _sa_drive_service. Writes never take that path - a file created by the
+service account would live in its empty Drive, invisible to him.
 
 WHAT THE TOKEN ALLOWS AND WHAT THIS MODULE ALLOWS ARE NOT THE SAME THING, and
 the gap is deliberate. Google has no scope that means "read everything, write
@@ -47,6 +52,7 @@ around. Rule 1 had that conversation, and the answer was yes.
 """
 
 import io
+import json
 import logging
 import os
 import re
@@ -55,7 +61,9 @@ import attachment_readers
 import google_scopes
 
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
 logger = logging.getLogger(__name__)
@@ -121,6 +129,74 @@ def _drive_service():
         )
         _service = build("drive", "v3", credentials=credentials, cache_discovery=False)
     return _service
+
+
+# --- the bot's own identity ------------------------------------------------
+#
+# Itai shares files with the BOT'S address - the calendar's service account -
+# exactly the way he shares with a person. That identity is read into Drive
+# here, as a second, strictly read-only path for files shared with the bot.
+#
+# Why the calendar cannot feel this. A service-account key is an identity, not
+# a bundle of permissions: scopes are chosen per credentials object, and
+# calendar_tools keeps its own object with the calendar scope alone. This one
+# is a separate object with drive.readonly and nothing more - the module below
+# never passes it to create, update, delete or permissions. The calendar code
+# itself is untouched, and the two modules share nothing but the same env var.
+#
+# One production caveat: the SA's Google Cloud project (gen-lang-client-0890389089)
+# must have the Google Drive API enabled, or every call on this path fails with
+# a 403 that means "API off", not "file missing". Enabling it is a console
+# click - see docs/STATUS.md.
+SA_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+_sa_service = None
+
+
+def _sa_email() -> str:
+    """The address files are shared to, read out of the key itself so the
+    not-found hint can never drift from the identity actually in use."""
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not raw:
+        return ""
+    try:
+        return json.loads(raw).get("client_email", "")
+    except Exception:
+        return ""
+
+
+def _sa_drive_service():
+    """Drive as the bot itself, read-only. Raises when no SA key is configured."""
+    global _sa_service
+    if _sa_service is None:
+        raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        if not raw:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(raw), scopes=SA_SCOPES
+        )
+        _sa_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    return _sa_service
+
+
+def _is_missing(error) -> bool:
+    """404 is "not there or not shared with you" - Drive answers it for both,
+    on purpose. 403 on a files().get is the shared-drive flavour of the same
+    wall. Either is worth a second try as the bot; anything else (a 500, a
+    quota refusal) means the first answer was real."""
+    return isinstance(error, HttpError) and getattr(error.resp, "status", None) in (403, 404)
+
+
+def _not_found_hint() -> str:
+    """What Itai can actually do about a file neither identity can see. The
+    addresses come from the live configuration, never from memory."""
+    hint = "❌ הקובץ לא נמצא - לא בדרייב של איתי ולא אצל הבוט."
+    sa = _sa_email()
+    if sa:
+        hint += f"\nאולי שיתפת עם חשבון אחר? שתף את הקובץ עם {sa} (הכתובת של הבוט)"
+    hint += ("\nאו עם itai.samsung.isr@gmail.com, או הפעל 'כל מי שיש לו קישור יכול לצפות'"
+             " ושלח את הקישור - כל אחת משלוש הדרכים עובדת.")
+    return hint
 
 
 def _escape(value: str) -> str:
@@ -264,6 +340,11 @@ def read_drive_file(file_id: str, part: int = 1) -> str:
     as email with a link, and the id inside it is extracted here. Never open
     such a link with read_web_page: the browser hits a login wall, this does not.
 
+    A file is looked up as Itai first (his Drive, his shares), then as the bot's
+    own service-account identity - the address he can share files TO directly.
+    Only when both miss does the answer say so, and that answer names the
+    addresses that DO work, taken from the live configuration.
+
     Args:
         file_id: The file's Drive id, as it appeared in square brackets, or its link.
         part: Which page of a long file to read. Starts at 1.
@@ -276,34 +357,47 @@ def read_drive_file(file_id: str, part: int = 1) -> str:
         return "צריך מזהה קובץ."
     logger.info(f"Drive tool: read_drive_file(file_id={file_id!r}, part={part})")
     try:
-        service = _drive_service()
-        meta = service.files().get(
-            fileId=file_id, fields="id, name, mimeType, size", supportsAllDrives=True
-        ).execute()
-        name = meta.get("name", "file")
-        mime = meta.get("mimeType", "")
-
-        if mime == FOLDER_MIME:
-            return f"'{name}' היא תיקייה, לא קובץ. אפשר לחפש בתוכה עם search_drive."
-
-        if mime in GOOGLE_EXPORTS:
-            export_mime, extension = GOOGLE_EXPORTS[mime]
-            raw = service.files().export(fileId=file_id, mimeType=export_mime).execute()
-            filename = f"{name}.{extension}"
-        else:
-            size = int(meta.get("size") or 0)
-            if size > attachment_readers.MAX_ATTACHMENT_BYTES:
-                mb = attachment_readers.MAX_ATTACHMENT_BYTES / (1024 * 1024)
-                return f"'{name}' גדול מדי לקריאה ({size / (1024 * 1024):.1f}MB, המקסימום {mb:.0f}MB)."
-            raw = service.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
-            filename = name
-
-        if isinstance(raw, str):
-            raw = raw.encode("utf-8")
-        return attachment_readers.extract_text(filename, raw, mime_type=mime, part=part)
+        return _read_with_service(_drive_service(), file_id, part)
     except Exception as e:
-        logger.error(f"read_drive_file failed for {file_id!r}: {e}")
-        return f"❌ קריאת הקובץ נכשלה: {e}"
+        if not _is_missing(e):
+            logger.error(f"read_drive_file failed for {file_id!r}: {e}")
+            return f"❌ קריאת הקובץ נכשלה: {e}"
+        logger.info(f"read_drive_file: {file_id!r} not visible to the user token - trying as the bot")
+    if _sa_email():
+        try:
+            return _read_with_service(_sa_drive_service(), file_id, part)
+        except Exception as e:
+            logger.error(f"read_drive_file via the service account failed for {file_id!r}: {e}")
+    return _not_found_hint()
+
+
+def _read_with_service(service, file_id: str, part: int) -> str:
+    """The read itself, run once as Itai and, on a clean miss, once as the bot.
+    Identical work either way - only the identity asking changes."""
+    meta = service.files().get(
+        fileId=file_id, fields="id, name, mimeType, size", supportsAllDrives=True
+    ).execute()
+    name = meta.get("name", "file")
+    mime = meta.get("mimeType", "")
+
+    if mime == FOLDER_MIME:
+        return f"'{name}' היא תיקייה, לא קובץ. אפשר לחפש בתוכה עם search_drive."
+
+    if mime in GOOGLE_EXPORTS:
+        export_mime, extension = GOOGLE_EXPORTS[mime]
+        raw = service.files().export(fileId=file_id, mimeType=export_mime).execute()
+        filename = f"{name}.{extension}"
+    else:
+        size = int(meta.get("size") or 0)
+        if size > attachment_readers.MAX_ATTACHMENT_BYTES:
+            mb = attachment_readers.MAX_ATTACHMENT_BYTES / (1024 * 1024)
+            return f"'{name}' גדול מדי לקריאה ({size / (1024 * 1024):.1f}MB, המקסימום {mb:.0f}MB)."
+        raw = service.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
+        filename = name
+
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    return attachment_readers.extract_text(filename, raw, mime_type=mime, part=part)
 
 
 def create_drive_file(name: str, content: str, file_type: str = "doc") -> str:
@@ -406,6 +500,75 @@ def update_drive_file(file_id: str, content: str) -> str:
     except Exception as e:
         logger.error(f"update_drive_file failed for {file_id!r}: {e}")
         return f"❌ עדכון הקובץ נכשל: {e}"
+
+
+def save_to_drive_folder(file_id: str) -> str:
+    """Files a shared file into the assistant's working folder, as a shortcut.
+
+    Use it when Itai wants a file someone shared - with him or with the bot -
+    to live in the working folder so it is found and managed from one place.
+    A shortcut points at the original: no copy is made, nothing duplicates, and
+    the owner's updates keep showing through. Reading the file is not needed
+    first; give the id or the share link directly.
+
+    Tried as Itai first (a shared-with-him file is visible to his token), then
+    as the bot - a file shared only with the bot's address can still be filed,
+    if the working folder itself was shared with that address as Editor. A
+    bot-filed shortcut is owned by the service account but shows in his folder
+    like any other item.
+
+    Args:
+        file_id: The shared file's Drive id, or its share link.
+
+    Returns:
+        Confirmation naming where it was filed, or the reason it failed.
+    """
+    file_id = _extract_file_id(file_id)
+    if not file_id:
+        return _refuse_write("צריך מזהה קובץ או קישור.")
+    if not FOLDER_ID:
+        return _refuse_write("לא הוגדרה תיקיית עבודה בדרייב (DRIVE_FOLDER_ID), אז אין לאן לשמור.")
+
+    logger.info(f"Drive tool: save_to_drive_folder(file_id={file_id!r})")
+    try:
+        created = _file_shortcut(_drive_service(), file_id)
+        return f"✅ נשמר בתיקיית העבודה: {created.get('name')} [id:{created.get('id')}]"
+    except Exception as e:
+        if not _is_missing(e):
+            logger.error(f"save_to_drive_folder failed for {file_id!r}: {e}")
+            return _refuse_write(f"שמירת הקובץ נכשלה: {e}")
+    if _sa_email():
+        try:
+            created = _file_shortcut(_sa_drive_service(), file_id)
+            return (
+                f"✅ נשמר בתיקיית העבודה דרך הכתובת של הבוט: {created.get('name')} "
+                f"[id:{created.get('id')}]"
+            )
+        except Exception as e:
+            logger.error(f"save_to_drive_folder via the service account failed for {file_id!r}: {e}")
+    return _refuse_write(
+        "הקובץ לא נמצא - לא אצל איתי ולא אצל הבוט, אז אין מה לשמור. "
+        "שתף אותו קודם עם אחת הכתובות, או הפעל 'כל מי שיש לו קישור יכול לצפות'."
+    )
+
+
+def _file_shortcut(service, file_id: str) -> dict:
+    """Creates the shortcut itself, as whichever identity can see the file.
+    The body keeps parents inline: the guard test walks every create() in this
+    module and fails any whose body does not name FOLDER_ID."""
+    meta = service.files().get(
+        fileId=file_id, fields="name", supportsAllDrives=True
+    ).execute()
+    return service.files().create(
+        body={
+            "name": meta.get("name", file_id),
+            "mimeType": "application/vnd.google-apps.shortcut",
+            "shortcutDetails": {"targetId": file_id},
+            "parents": [FOLDER_ID],
+        },
+        fields="id, name",
+        supportsAllDrives=True,
+    ).execute()
 
 
 def trash_drive_file(file_id: str, permanent: bool = False) -> str:

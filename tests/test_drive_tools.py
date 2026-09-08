@@ -399,3 +399,172 @@ def test_a_long_listing_is_truncated_instead_of_flooding_whatsapp():
         out = drive_tools.search_drive("קובץ")
     assert len(out) <= drive_tools.MAX_LISTING_CHARS + 40
     assert "קוצרה" in out
+
+
+# --- the bot's own identity: files shared with the service account -----------
+#
+# Itai shares files with the bot's address (the calendar service account) the
+# way he shares with a person. read_drive_file tries as Itai first, then as
+# the bot, and a double miss names the addresses that work.
+
+from googleapiclient.errors import HttpError
+
+
+def _missing(status=404):
+    resp = MagicMock(status=status, reason="Not Found")
+    return HttpError(resp, b"{}")
+
+
+SA_JSON = '{"client_email": "calendar-bot@proj.iam.gserviceaccount.com"}'
+
+
+def test_a_file_shared_with_the_bot_is_read_on_the_second_identity(monkeypatch):
+    """The user token says 404, the bot's identity opens the file. This is the
+    whole feature: 'share with the bot's email' must just work."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    user_files = MagicMock()
+    user_files.get.return_value.execute.side_effect = _missing()
+    bot_files = _files(
+        get={"id": "f1", "name": "מחירון", "mimeType": "application/vnd.google-apps.document"},
+        export=b"tekst",
+    )
+    with patch.object(drive_tools, "_drive_service", return_value=_service(user_files)), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(bot_files)), \
+         patch.object(drive_tools.attachment_readers, "extract_text", return_value="טקסט המחירון"):
+        out = drive_tools.read_drive_file("f1")
+    assert out == "טקסט המחירון"
+    bot_files.export.assert_called_once()
+
+
+def test_a_file_visible_to_neither_identity_gets_the_sharing_hint(monkeypatch):
+    """A bare 'not found' taught him nothing. The double miss must name the two
+    addresses that work - and they come from the live key, not from memory."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    dead = MagicMock()
+    dead.get.return_value.execute.side_effect = _missing()
+    with patch.object(drive_tools, "_drive_service", return_value=_service(dead)), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(dead)):
+        out = drive_tools.read_drive_file("f-gone")
+    assert "calendar-bot@proj.iam.gserviceaccount.com" in out
+    assert "itai.samsung.isr@gmail.com" in out
+    assert "כל מי שיש לו קישור" in out
+
+
+def test_without_an_sa_key_the_hint_names_only_his_account(monkeypatch):
+    """No service-account key means no second identity to try and no address to
+    invent - the hint falls back to his account alone."""
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+    dead = MagicMock()
+    dead.get.return_value.execute.side_effect = _missing()
+    with patch.object(drive_tools, "_drive_service", return_value=_service(dead)):
+        out = drive_tools.read_drive_file("f-gone")
+    assert "itai.samsung.isr@gmail.com" in out
+    assert "calendar-bot" not in out
+
+
+def test_a_real_error_does_not_fall_through_to_the_bot(monkeypatch):
+    """The second identity is for clean misses (403/404). A 500 from Google is
+    a real failure - retrying it as the bot would only double the noise."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    broken = MagicMock()
+    broken.get.return_value.execute.side_effect = _missing(500)
+    with patch.object(drive_tools, "_drive_service", return_value=_service(broken)), \
+         patch.object(drive_tools, "_sa_drive_service") as sa:
+        out = drive_tools.read_drive_file("f1")
+    sa.assert_not_called()
+    assert "נכשלה" in out
+
+
+def test_the_service_account_identity_is_read_from_the_key(monkeypatch):
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    assert drive_tools._sa_email() == "calendar-bot@proj.iam.gserviceaccount.com"
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    assert drive_tools._sa_email() == ""
+
+
+def test_the_service_account_path_is_read_only_by_scope_and_by_use():
+    """drive.readonly is the only scope the SA credentials ever ask for, and the
+    SA service is never handed to create, update, delete or permissions - the
+    bot's identity can read a shared file and nothing else."""
+    assert drive_tools.SA_SCOPES == ["https://www.googleapis.com/auth/drive.readonly"]
+    tree = _tree()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in ("create", "update", "delete"):
+            source = ast.dump(node)
+            assert "_sa_drive_service" not in source
+
+
+def test_the_bot_path_does_not_touch_the_calendar_module():
+    """The two modules share an env var and nothing else: calendar_tools keeps
+    its own credentials with its own scope, and drive_tools must not import it."""
+    imported = {
+        node.names[0].name
+        for node in ast.walk(_tree())
+        if isinstance(node, ast.Import)
+    } | {
+        node.module
+        for node in ast.walk(_tree())
+        if isinstance(node, ast.ImportFrom)
+    }
+    assert "calendar_tools" not in imported
+
+
+# --- filing shared files into the working folder ------------------------------
+
+def test_a_shared_file_is_filed_as_a_shortcut_in_the_working_folder():
+    """Shortcuts point at the original - no copy, no quota, the owner's updates
+    keep showing through. And like every create in this module, it must land in
+    the working folder or not happen."""
+    files = _files(
+        get={"name": "מלאי סניפים"},
+        create={"id": "sc1", "name": "מלאי סניפים"},
+    )
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        out = drive_tools.save_to_drive_folder("f-shared")
+    kwargs = files.create.call_args.kwargs
+    assert kwargs["body"]["mimeType"] == "application/vnd.google-apps.shortcut"
+    assert kwargs["body"]["shortcutDetails"] == {"targetId": "f-shared"}
+    assert kwargs["body"]["parents"] == [FOLDER]
+    assert "מלאי סניפים" in out
+
+
+def test_filing_falls_back_to_the_bot_for_bot_only_shares(monkeypatch):
+    """A file shared only with the bot's address is invisible to his token, but
+    the bot can still file it - if the working folder was shared with the bot
+    as Editor."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    dead = MagicMock()
+    dead.get.return_value.execute.side_effect = _missing()
+    bot = _files(get={"name": "דוח שבועי"}, create={"id": "sc2", "name": "דוח שבועי"})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_drive_service", return_value=_service(dead)), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(bot)):
+        out = drive_tools.save_to_drive_folder("f-bot-only")
+    assert "נשמר" in out and "הבוט" in out
+
+
+def test_filing_a_file_neither_identity_sees_says_to_share_first(monkeypatch):
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    dead = MagicMock()
+    dead.get.return_value.execute.side_effect = _missing()
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_drive_service", return_value=_service(dead)), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(dead)):
+        out = drive_tools.save_to_drive_folder("f-gone")
+    assert "שתף אותו קודם" in out
+    dead.create.assert_not_called()
+
+
+def test_filing_without_a_working_folder_is_refused():
+    with patch.object(drive_tools, "FOLDER_ID", ""):
+        out = drive_tools.save_to_drive_folder("f1")
+    assert "לא הוגדרה תיקיית עבודה" in out
+
+
+def test_the_filing_tool_is_registered_and_the_prompt_knows_the_rule():
+    import assistant
+    assert assistant.save_to_drive_folder in assistant.tools_list
+    assert "save_to_drive_folder" in assistant.SYSTEM_PROMPT
+    assert "one folder, nowhere else" in assistant.SYSTEM_PROMPT

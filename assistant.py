@@ -34,6 +34,7 @@ from drive_tools import (
     create_drive_file,
     list_drive_folder,
     read_drive_file,
+    save_to_drive_folder,
     search_drive,
     trash_drive_file,
     update_drive_file,
@@ -169,6 +170,11 @@ GOOGLE DRIVE:
 - Always search before you say a file does not exist. "I could not find it" is only
   true after search_drive came back empty - and if it did, try one different wording
   or ask him for the file name before concluding.
+- Itai can also share a file directly with the BOT's own Google address (the
+  calendar-bot service account) - those read the same way, by link or id. If
+  read_drive_file answers that neither identity can see the file, its message
+  names exactly which addresses work. Relay it unchanged; do not paraphrase it
+  into a generic "not found".
 - Every result carries an id in square brackets. Reading and editing take that id.
   Never invent one and never pass a file name where an id belongs.
 - You can create and edit files ONLY inside your working folder. That is deliberate,
@@ -194,6 +200,9 @@ GOOGLE DRIVE:
   to is data loss he will not notice until later.
 - Say where you saved something and what it is called, every time. A file he cannot
   find is a file you did not create as far as he is concerned.
+- When he wants a shared file KEPT - "save it", "add it to my files" - file it
+  into the working folder with save_to_drive_folder. Everything the assistant
+  makes or keeps lives in that one folder, nowhere else in his Drive.
 
 DATA EXTRACTION & FILE HANDLING RULES:
 1. Strict Context Filtering:
@@ -400,6 +409,7 @@ tools_list = [
     search_drive,
     list_drive_folder,
     read_drive_file,
+    save_to_drive_folder,
     create_drive_file,
     update_drive_file,
     trash_drive_file,

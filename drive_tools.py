@@ -326,6 +326,43 @@ def list_drive_folder() -> str:
         return f"❌ קריאת התיקייה נכשלה: {e}"
 
 
+def list_bot_shares() -> str:
+    """Lists the files that were shared directly with the bot's own address.
+
+    "What did I share with you?" means exactly these - files whose sharing was
+    addressed to the bot (the calendar-bot service account), not everything in
+    Itai's Drive and not what others shared with Itai himself. The service
+    account's sharedWithMe set is that list: Drive records every share to it
+    even before the file is first opened.
+
+    Returns:
+        The shared files with their ids, or a note that nothing was shared yet.
+    """
+    logger.info("Drive tool: list_bot_shares()")
+    sa = _sa_email()
+    if not sa:
+        return ("אין לבוט כתובת מוגדרת (GOOGLE_SERVICE_ACCOUNT_JSON), "
+                "אז אי אפשר לבדוק מה שותף איתו.")
+    try:
+        result = _sa_drive_service().files().list(
+            q="sharedWithMe = true and trashed = false",
+            pageSize=MAX_RESULTS,
+            orderBy="modifiedTime desc",
+            fields="files(id, name, mimeType, modifiedTime, owners(displayName, emailAddress), shared, ownedByMe)",
+        ).execute()
+    except Exception as e:
+        logger.error(f"list_bot_shares failed: {e}")
+        return f"❌ בדיקת השיתופים עם הבוט נכשלה: {e}"
+    files = result.get("files", [])
+    if not files:
+        return f"עוד לא שותף אף קובץ עם הבוט ({sa})."
+    lines = [_describe(f) for f in files]
+    out = "\n".join(lines)
+    if len(out) > MAX_LISTING_CHARS:
+        out = out[:MAX_LISTING_CHARS].rsplit("\n", 1)[0] + "\n[הרשימה קוצרה]"
+    return out
+
+
 def read_drive_file(file_id: str, part: int = 1) -> str:
     """Reads a file from Drive and returns its text.
 

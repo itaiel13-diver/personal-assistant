@@ -51,7 +51,12 @@ PROVIDERS = (
         "url": "https://api.groq.com/openai/v1/chat/completions",
         "key_env": "GROQ_API_KEY",
         "model_env": "GROQ_MODEL_NAME",
-        "model": "llama-3.3-70b-versatile",
+        # llama-3.3-70b-versatile was decommissioned on 2026-08-16; every call to
+        # it returns an error, which silently cut the cascade's biggest tier.
+        # gpt-oss-120b is Groq's designated successor on the free tier. If Render
+        # still pins GROQ_MODEL_NAME to the old id it wins over this default -
+        # the variable must be cleared there, not just here.
+        "model": "openai/gpt-oss-120b",
     },
     {
         "name": "openrouter",

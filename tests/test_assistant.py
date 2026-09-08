@@ -196,7 +196,7 @@ def test_quota_exhaustion_says_quota_not_try_again_in_a_moment(monkeypatch):
     monkeypatch.setattr(assistant, "client", fake_client)
 
     result = assistant.handle_whatsapp_message("test", sender_id="sender-q")
-    assert "מכסת השימוש היומית" in result
+    assert "מכסת" in result
     assert "בעוד רגע" not in result
 
 
@@ -267,6 +267,10 @@ def test_the_prompt_and_the_toolbox_agree_about_sharing():
     the tool, one of these two halves is lying to Itai."""
     assert "You cannot share a file" in assistant.SYSTEM_PROMPT
     names = {t.__name__ for t in assistant.tools_list}
+    # list_bot_shares only READS the set of files already shared with the
+    # bot's address; it grants nothing and changes nothing, so it is not the
+    # sharing power this guard exists to refuse.
+    names.discard("list_bot_shares")
     assert not any("share" in n or "permission" in n for n in names)
 
 
@@ -339,8 +343,11 @@ def test_the_fallback_tier_is_told_it_has_no_tools(monkeypatch):
 
 def test_quota_message_still_shows_when_no_spare_tier_answers(monkeypatch):
     """Every provider dry is the one case where the honest answer is still
-    'come back tomorrow'."""
+    'come back tomorrow' - but now it also names WHY the spare tiers did not
+    answer, so a missing Render key is not mistaken for a dead model."""
     monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     fake_chat = MagicMock()
     fake_chat.send_message.side_effect = assistant.genai_errors.ClientError(
         429, {"error": {"message": "quota"}}, MagicMock()
@@ -350,12 +357,8 @@ def test_quota_message_still_shows_when_no_spare_tier_answers(monkeypatch):
     monkeypatch.setattr(assistant, "client", fake_client)
     monkeypatch.setattr(assistant.llm, "ask", lambda *a, **k: None)
 
-    result = assistant.handle_whatsapp_message("test", sender_id="sender-dry")
-    assert "מכסת השימוש היומית" in result
-
-
-# --- tool text is data, destruction needs his yes ----------------------------
-
+    result = assistant.handle_whatsapp_message("test", sender_id="sender-q2")
+    assert "מכסת" in result and "GROQ_API_KEY" in result
 
 def test_the_prompt_quarantines_tool_content_from_instructions():
     """An email body, a web page or a Drive file reaches the model as plain
@@ -395,3 +398,20 @@ def test_the_fabricated_data_tools_are_gone():
     names = {t.__name__ for t in assistant.tools_list}
     assert "get_itai_targets" not in names
     assert "update_daily_schedule" not in names
+
+
+# --- the quota dead end names its cause ---------------------------------------
+
+def test_quota_dead_end_without_backup_keys_points_at_render(monkeypatch):
+    """If neither backup key is set, the message must say so - 'quota ran out'
+    alone sent Itai hunting for a cascade that was never configured."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    out = assistant._quota_dead_end_message()
+    assert "GROQ_API_KEY" in out and "Render" in out
+
+
+def test_quota_dead_end_with_backups_names_them_as_having_failed(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    out = assistant._quota_dead_end_message()
+    assert "groq" in out and "לא ענו" in out

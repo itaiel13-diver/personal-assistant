@@ -324,3 +324,43 @@ def test_a_mixed_portfolio_prices_each_side_from_its_own_feed():
     assert lines[0].startswith("NVIDIA (NVDA.US): 175")
     assert lines[1].startswith("ביטקוין (BTC): $80,000")
 
+
+
+def test_an_israeli_holding_is_priced_from_the_tase_feed():
+    import portfolio
+    holdings = [{"name": "טבע", "symbol": "629014", "quantity": 100}]
+    with patch.object(portfolio, "load_holdings", return_value=holdings), \
+         patch.object(es.tase, "quotes",
+                      return_value={"629014": {"kind": "security", "close": 109.2,
+                                               "change_pct": 0.09,
+                                               "date": "08/09"}}) as tase_q:
+        lines = es.stocks_section()
+    tase_q.assert_called_once_with(["629014"])
+    assert lines[0].startswith("טבע (629014): ₪109.20")
+
+
+def test_a_mixed_portfolio_prices_israeli_us_and_crypto_from_their_own_feeds():
+    import portfolio
+    holdings = [
+        {"name": "NVIDIA", "symbol": "NVDA", "quantity": 10, "cost": 150.0},
+        {"name": "טבע", "symbol": "629014", "quantity": 100},
+        {"kind": "crypto", "coingecko_id": "bitcoin", "symbol": "BTC",
+         "name": "ביטקוין (BTC)", "quantity": 0.35},
+    ]
+    with patch.object(portfolio, "load_holdings", return_value=holdings), \
+         patch.object(es, "_stooq_quotes",
+                      return_value={"NVDA.US": {"close": 175.0, "open": 170.0}}) as stooq, \
+         patch.object(es, "_coingecko_quotes",
+                      return_value={"bitcoin": {"price": 80000.0,
+                                                "change_24h": 1.5}}) as gecko, \
+         patch.object(es.tase, "quotes",
+                      return_value={"629014": {"kind": "security", "close": 109.2,
+                                               "change_pct": 0.09,
+                                               "date": "08/09"}}) as tase_q:
+        lines = es.stocks_section()
+    stooq.assert_called_once_with(["NVDA.US"])
+    gecko.assert_called_once_with(["bitcoin"])
+    tase_q.assert_called_once_with(["629014"])
+    assert lines[0].startswith("NVIDIA (NVDA.US): 175")
+    assert lines[1].startswith("טבע (629014): ₪109.20")
+    assert lines[2].startswith("ביטקוין (BTC): $80,000")

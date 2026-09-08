@@ -33,9 +33,9 @@ Three deliberate data-source choices:
   public tier), not from a search: a structured feed cannot hallucinate a
   score, and it costs no Tavily credit.
 - The portfolio comes from the holdings export Itai forwarded once from the
-  Excellence app (portfolio.py). His broker offers no public API to retail
-  clients - verified 2026-09-08 - so the stored export plus stooq's free
-  prices is the source of truth.
+  Excellence app (portfolio.py). US and global tickers price from stooq's
+  free feed; Israeli securities price from the Tel Aviv Stock Exchange's
+  own feeds by their נייר number (tase.py) - end-of-day, in shekels, dated.
 - Crypto arrives by chat, not by export (portfolio.py), and is priced from
   CoinGecko's free JSON API in USD: a structured feed, no key, and the coin's
   line keeps its dollars to itself - never folded into the shekel holdings.
@@ -55,6 +55,7 @@ import requests
 import llm
 import portfolio
 import storage
+import tase
 
 logger = logging.getLogger(__name__)
 
@@ -261,14 +262,17 @@ def fetch_stocks(symbols: list) -> list:
 def stocks_section() -> list:
     """The portfolio review when Itai handed one over, else the configured
     watchlist. Every number in either comes from the export or the feeds:
-    stooq for the securities, CoinGecko for the coins."""
+    stooq for US/global tickers, the exchange's own feeds for Israeli
+    securities, CoinGecko for the coins."""
     holdings = portfolio.load_holdings()
     if holdings:
         symbols = [s for s in (portfolio.stooq_symbol(h) for h in holdings) if s]
         coin_ids = [h["coingecko_id"] for h in holdings
                     if h.get("kind") == "crypto" and h.get("coingecko_id")]
+        tase_ids = [t for t in (portfolio.tase_security_id(h) for h in holdings) if t]
         return portfolio.review_lines(
-            holdings, _stooq_quotes(symbols), _coingecko_quotes(coin_ids))
+            holdings, _stooq_quotes(symbols), _coingecko_quotes(coin_ids),
+            tase.quotes(tase_ids))
     return fetch_stocks(stock_symbols())
 
 

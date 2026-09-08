@@ -364,7 +364,78 @@ def unanswered_mail(now: datetime) -> list:
     return due
 
 
-ROUTINES = (attendance, reminders, unanswered_mail, new_mail)
+# --- one question a day ---------------------------------------------------
+#
+# The only routine here that makes the assistant better rather than making Itai
+# better informed. Everything it knows about his territory, his people and how
+# he wants to be helped has to come from him, and it has never once asked -
+# so once a day, at an hour when nothing else is competing for his attention,
+# it asks exactly one question and remembers the answer forever.
+#
+# The rules that keep it from becoming a nuisance live in curiosity.py; the
+# only one that matters here is that a question is asked once, ever. Silence is
+# a legitimate answer and is not followed up.
+
+QUESTION_AT = time(12, 30)
+
+
+def _question_text(question) -> str:
+    return "\n".join([
+        "🧠 *שאלה אחת*",
+        question.text,
+        "",
+        "(תענה כשנוח לך — אני אזכור את זה לתמיד ולא אשאל שוב. אם זה לא רלוונטי, תגיד לי ונתקדם.)",
+    ])
+
+
+def daily_question(now: datetime) -> list:
+    """One thing the assistant does not know about Itai, asked out loud."""
+    if now.weekday() not in WORK_DAYS:
+        return []
+    if _is_due(now, QUESTION_AT) < 0:
+        return []
+
+    # A day claim, taken before any question is chosen. Without it the three or
+    # four ticks inside the grace window would each pick a different unasked
+    # question and he would get his one question a day three times.
+    day = f"question:day:{now:%Y-%m-%d}"
+    if not storage.claim(day, "question"):
+        return []
+
+    import curiosity
+
+    chosen = []
+
+    def claim(key: str) -> bool:
+        fingerprint = f"question:{key}"
+        if storage.claim(fingerprint, "question"):
+            chosen.append(fingerprint)
+            return True
+        return False
+
+    try:
+        question = curiosity.ask_next(claim)
+    except Exception:
+        storage.release(day)
+        raise
+
+    if question is None:
+        # Nothing left to ask, and no model to invent one. The day claim stays:
+        # asking again in twenty minutes would not produce a different answer.
+        return []
+
+    return [Due(
+        chosen[-1],
+        "question",
+        _question_text(question),
+        preclaimed=True,
+        # If the message never goes out, the day goes back too - otherwise a
+        # failed send today costs him the question and the day both.
+        on_failed=lambda: storage.release(day),
+    )]
+
+
+ROUTINES = (attendance, reminders, unanswered_mail, new_mail, daily_question)
 
 
 # --- the tick ------------------------------------------------------------

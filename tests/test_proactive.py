@@ -174,6 +174,19 @@ def sent(monkeypatch):
     return fill
 
 
+@pytest.fixture(autouse=True)
+def knows_nothing(monkeypatch):
+    """The daily question runs against an empty long-term memory and no model.
+
+    Autouse for the same reason as the mailbox fixtures: daily_question is in
+    the default ROUTINES, so without this a tick at 12:30 would open a database
+    connection to find out what it already knows.
+    """
+    import curiosity
+    monkeypatch.setattr(curiosity, "_memory", lambda: {})
+    monkeypatch.setattr(curiosity.llm, "ask_json", lambda *a, **k: None)
+
+
 def mail(id, sender="dana@impact.co.il", subject="נושא", snippet="גוף ההודעה",
          list_unsubscribe="", labels=None):
     return {"id": id, "sender": sender, "subject": subject,
@@ -850,3 +863,116 @@ def test_gmail_falling_over_does_not_stop_the_chaser_taking_the_tick_down(ledger
     summary = proactive.run_tick(outbox, now=now)
     assert len(outbox.sent) == 1
     assert "רישום כניסה" in outbox.sent[0][1]
+
+
+# --- one question a day ---------------------------------------------------
+
+
+def test_the_daily_question_is_asked_at_its_hour(ledger):
+    now = at(SUNDAY, "12:30")
+    ledger(now=now)
+    due = proactive.daily_question(now)
+    assert len(due) == 1
+    assert due[0].kind == "question"
+    assert due[0].fingerprint == "question:store_rishon_lezion"
+    assert "ראשון לציון" in due[0].text
+    assert "שאלה אחת" in due[0].text
+
+
+def test_the_question_says_it_will_not_be_asked_again(ledger):
+    """The invitation is half the design: he can ignore it at no cost, which is
+    what makes an unprompted question tolerable at all."""
+    now = at(SUNDAY, "12:30")
+    ledger(now=now)
+    assert "לא אשאל שוב" in proactive.daily_question(now)[0].text
+
+
+def test_one_question_a_day_survives_several_ticks_in_the_grace_window(ledger):
+    """The pinger fires every half hour and the grace is over an hour wide, so
+    without a claim on the day itself he would get three different questions
+    over lunch instead of one."""
+    fake = ledger(now=at(SUNDAY, "12:30"))
+    assert len(proactive.daily_question(at(SUNDAY, "12:30"))) == 1
+    assert proactive.daily_question(at(SUNDAY, "13:00")) == []
+    assert proactive.daily_question(at(SUNDAY, "13:40")) == []
+    assert fake.claimed == {f"question:day:{SUNDAY}", "question:store_rishon_lezion"}
+
+
+def test_tomorrow_asks_the_next_question_rather_than_the_same_one(ledger):
+    fake = ledger(now=at(SUNDAY, "12:30"))
+    first = proactive.daily_question(at(SUNDAY, "12:30"))[0]
+    second = proactive.daily_question(at("2026-09-07", "12:30"))[0]
+    assert first.fingerprint != second.fingerprint
+    assert second.fingerprint == "question:store_ramla"
+
+
+def test_nothing_is_asked_outside_the_slot(ledger):
+    now = at(SUNDAY, "15:00")
+    ledger(now=now)
+    assert proactive.daily_question(now) == []
+
+
+def test_nothing_is_asked_on_a_friday(ledger):
+    now = at(FRIDAY, "12:30")
+    ledger(now=now)
+    assert proactive.daily_question(now) == []
+
+
+def test_a_question_he_has_already_answered_is_skipped(ledger, monkeypatch):
+    import curiosity
+    monkeypatch.setattr(curiosity, "_memory",
+                        lambda: {"store_rishon_lezion": {"value": "סניף ראשון"}})
+    now = at(SUNDAY, "12:30")
+    ledger(now=now)
+    assert proactive.daily_question(now)[0].fingerprint == "question:store_ramla"
+
+
+def test_a_failed_send_gives_back_the_day_as_well_as_the_question(ledger):
+    """Otherwise a WhatsApp outage at lunchtime costs him the question and the
+    day both, and the question - claimed but never sent - is lost forever."""
+    now = at(SUNDAY, "12:30")
+    fake = ledger(now=now)
+    proactive.run_tick(Outbox(ok=False), now=now)
+    assert fake.claimed == set()
+    assert f"question:day:{SUNDAY}" in fake.released
+
+
+def test_a_shut_window_gives_the_question_back_too(ledger):
+    now = at(SUNDAY, "12:30")
+    fake = ledger(now=now, wrote_at=now - timedelta(days=3))
+    summary = proactive.run_tick(Outbox(), now=now)
+    assert summary["held"] == ["question:store_rishon_lezion"]
+    assert fake.claimed == set()
+
+
+def test_the_question_reaches_his_phone_through_the_ordinary_tick(ledger):
+    now = at(SUNDAY, "12:30")
+    ledger(now=now)
+    outbox = Outbox()
+    summary = proactive.run_tick(outbox, now=now)
+    assert summary["sent"] == ["question:store_rishon_lezion"]
+    assert "🧠" in outbox.sent[0][1]
+
+
+def test_the_assistant_remembers_having_asked(ledger):
+    """Written into the conversation, so that his one-line answer half an hour
+    later lands on a model that can see what it asked."""
+    now = at(SUNDAY, "12:30")
+    fake = ledger(now=now)
+    proactive.run_tick(Outbox(), now=now)
+    assert "ראשון לציון" in fake.turns[0][1]
+
+
+def test_curiosity_falling_over_gives_the_day_back_and_spares_the_tick(ledger, monkeypatch):
+    import curiosity
+
+    def broken(claim):
+        raise RuntimeError("memory is on fire")
+
+    now = at(SUNDAY, "12:30")
+    fake = ledger(now=now)
+    monkeypatch.setattr(curiosity, "ask_next", broken)
+    summary = proactive.run_tick(Outbox(), now=now)
+    assert summary["due"] == 0
+    # The day is not spent on a run that never asked anything.
+    assert fake.claimed == set()

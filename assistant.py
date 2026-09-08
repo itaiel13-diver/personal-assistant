@@ -9,6 +9,7 @@ from google.genai import types
 from google.genai import errors as genai_errors
 
 import storage
+import llm
 from gmail_tools import (
     create_email_draft,
     read_email,
@@ -360,6 +361,58 @@ def _send_with_retry(chat, text: str, attempts: int = 3):
     return _retry_on_server_error(lambda: chat.send_message(text), attempts=attempts)
 
 
+def _plain_history(sender_id: str, turns: int = 12) -> str:
+    """The stored conversation flattened to text, for a provider that has no
+    concept of our history format. Tool calls and their results are dropped -
+    the fallback cannot call tools, and showing it calls it cannot make would
+    only invite it to promise them."""
+    lines = []
+    for entry in storage.load_history(sender_id)[-turns:]:
+        if not isinstance(entry, dict):
+            continue
+        speaker = "Itai" if entry.get("role") == "user" else "Assistant"
+        for part in entry.get("parts") or []:
+            text = part.get("text") if isinstance(part, dict) else None
+            if text:
+                lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
+
+
+def _answer_without_gemini(incoming_text: str, sender_id: str) -> str | None:
+    """Answers on a spare free tier once Gemini's daily quota is gone.
+
+    This is a genuinely reduced assistant: no tools, so no mail, calendar, drive
+    or web - and it says so itself rather than inventing an answer it cannot
+    look up. That is still far better than the dead end this replaced, where
+    hitting the quota at 11am meant no assistant at all until midnight.
+    """
+    reply = llm.ask(
+        f"{_plain_history(sender_id)}\nItai: {incoming_text}",
+        system=(
+            SYSTEM_PROMPT
+            + _load_memory_context()
+            + _date_context()
+            + "\n\nIMPORTANT, ONLY FOR THIS REPLY: your tools are unavailable right now, "
+            "so you cannot read mail, search the web, or touch the calendar or Drive. "
+            "Answer from the conversation and your memory alone, in Hebrew. If the answer "
+            "needs a tool, say plainly that the daily AI quota ran out and you will be "
+            "able to check it later - never guess the contents of a mail or a calendar."
+        ),
+        max_tokens=800,
+        temperature=0.3,
+        skip=("gemini",),
+    )
+    if not reply:
+        return None
+    logger.info(f"Answered {sender_id} on the fallback tier")
+    if storage.enabled():
+        # The conversation must record what was said however it was produced,
+        # or the next question arrives with a hole where this answer should be.
+        storage.append_user_turn(sender_id, incoming_text)
+        storage.append_model_turn(sender_id, reply)
+    return reply
+
+
 # 5. מנוע השיחה הראשי
 def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> str:
     """
@@ -381,7 +434,11 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
         logger.error(f"Gemini client error for sender {sender_id}: {e}")
         # A 429 on the free tier is a daily quota that will not clear on a retry,
         # so telling the sender "temporary, try again in a moment" would be a lie.
+        # It is, however, exactly what the second and third free tiers are for.
         if getattr(e, "code", None) == 429:
+            spare = _answer_without_gemini(incoming_text, sender_id)
+            if spare:
+                return spare
             return "נגמרה מכסת השימוש היומית ב-AI. היא מתאפסת מחר, או שאפשר לשדרג את התוכנית."
         return "מצטער, יש תקלה בחיבור ל-AI. נסה/י שוב בעוד רגע."
     except Exception as e:

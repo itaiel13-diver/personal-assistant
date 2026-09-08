@@ -362,3 +362,18 @@ def append_model_turn(sender_id: str, text: str) -> None:
     history = load_history(sender_id)
     history.append({"role": "model", "parts": [{"text": text}]})
     save_history(sender_id, history)
+
+
+def append_user_turn(sender_id: str, text: str) -> None:
+    """Writes a message Itai sent into the conversation.
+
+    The normal path never needs this - the Gemini SDK records the user turn as
+    part of sending it. It is needed only when the reply came from a fallback
+    provider that knows nothing about our history, where without it the stored
+    conversation would show an answer to a question nobody asked.
+    """
+    if not enabled():
+        return
+    history = load_history(sender_id)
+    history.append({"role": "user", "parts": [{"text": text}]})
+    save_history(sender_id, history)

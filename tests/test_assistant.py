@@ -280,3 +280,75 @@ def test_the_prompt_tells_the_model_the_bin_is_the_default_and_not_destruction()
     assert "recoverable for 30 days" in prompt
     assert "Never pass that" in prompt
     assert assistant.trash_drive_file in assistant.tools_list
+
+
+def test_a_spare_free_tier_answers_when_gemini_is_out_of_quota(monkeypatch):
+    """Hitting the 20/day Gemini cap at 11am used to mean no assistant until
+    midnight. With a second free tier configured it means a reduced one."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    fake_chat = MagicMock()
+    fake_chat.send_message.side_effect = assistant.genai_errors.ClientError(
+        429, {"error": {"message": "quota"}}, MagicMock()
+    )
+    fake_client = MagicMock()
+    fake_client.chats.create.return_value = fake_chat
+    monkeypatch.setattr(assistant, "client", fake_client)
+
+    asked = {}
+
+    def fake_ask(prompt, system="", **kwargs):
+        asked["prompt"] = prompt
+        asked["system"] = system
+        asked["skip"] = kwargs.get("skip")
+        return "עניתי בכל זאת"
+
+    monkeypatch.setattr(assistant.llm, "ask", fake_ask)
+
+    result = assistant.handle_whatsapp_message("מה שלומך", sender_id="sender-spare")
+    assert result == "עניתי בכל זאת"
+    assert "מכסת השימוש" not in result
+    # Gemini has already refused on its own SDK; asking it again over HTTP
+    # would spend a round trip to be told the same thing.
+    assert asked["skip"] == ("gemini",)
+    assert "מה שלומך" in asked["prompt"]
+
+
+def test_the_fallback_tier_is_told_it_has_no_tools(monkeypatch):
+    """It cannot read mail or the calendar, so it must say so rather than
+    invent what is in them - the one failure mode that would be worse than
+    the quota message it replaces."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    fake_chat = MagicMock()
+    fake_chat.send_message.side_effect = assistant.genai_errors.ClientError(
+        429, {"error": {"message": "quota"}}, MagicMock()
+    )
+    fake_client = MagicMock()
+    fake_client.chats.create.return_value = fake_chat
+    monkeypatch.setattr(assistant, "client", fake_client)
+
+    seen = {}
+
+    def fake_ask(prompt, system="", **kwargs):
+        seen["system"] = system
+        return "תשובה"
+
+    monkeypatch.setattr(assistant.llm, "ask", fake_ask)
+    assistant.handle_whatsapp_message("תקרא לי מיילים", sender_id="sender-notools")
+    assert "tools are unavailable" in seen["system"]
+
+
+def test_quota_message_still_shows_when_no_spare_tier_answers(monkeypatch):
+    """Every provider dry is the one case where the honest answer is still
+    'come back tomorrow'."""
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    fake_chat = MagicMock()
+    fake_chat.send_message.side_effect = assistant.genai_errors.ClientError(
+        429, {"error": {"message": "quota"}}, MagicMock()
+    )
+    fake_client = MagicMock()
+    fake_client.chats.create.return_value = fake_chat
+    monkeypatch.setattr(assistant, "client", fake_client)
+    monkeypatch.setattr(assistant.llm, "ask", lambda *a, **k: None)
+
+    result = assistant.handle_whatsapp_message("test", sender_id="sender-dry")
+    assert "מכסת השימוש היומית" in result

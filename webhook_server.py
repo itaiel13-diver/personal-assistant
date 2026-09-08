@@ -10,8 +10,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import media_tools
 import proactive
 import storage
-from assistant import (handle_image_message, handle_voice_message,
-                         handle_whatsapp_message)
+from assistant import (handle_document_message, handle_image_message,
+                         handle_voice_message, handle_whatsapp_message)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -139,12 +139,15 @@ def _extract_incoming_message(payload: dict):
         message_type = message.get("type", "unknown")
         text = message.get("text", {}).get("body", "") if message_type == "text" else ""
         media = None
-        if message_type in ("image", "audio"):
+        if message_type in ("image", "audio", "document"):
             info = message.get(message_type) or {}
             media = {
                 "id": info.get("id"),
                 "mime_type": info.get("mime_type", ""),
                 "caption": info.get("caption", ""),
+                # Only documents carry a filename, and for a document it is
+                # the dispatch signal - the extension decides how it is read.
+                "filename": info.get("filename", ""),
             }
         return sender, text, message_type, media
     except (KeyError, IndexError, TypeError):
@@ -196,11 +199,29 @@ def receive_webhook():
         else:
             reply_text = "קיבלתי ששלחת הודעה קולית, אבל ההורדה שלה מוואטסאפ נכשלה. אפשר לשלוח אותה שוב?"
         _send_whatsapp_reply(sender, reply_text)
+    elif sender and message_type == "document" and media and media.get("id"):
+        data, mime = media_tools.download_media(media["id"])
+        if not data:
+            reply_text = "קיבלתי ששלחת קובץ, אבל ההורדה שלו מוואטסאפ נכשלה. אפשר לשלוח אותו שוב?"
+        else:
+            base = media_tools.base_mime(mime or media["mime_type"])
+            caption = media.get("caption", "")
+            # People send photos as documents to keep the original quality, and
+            # voice messages occasionally arrive as files - dispatch on what the
+            # bytes are, not on which button he pressed.
+            if base.startswith("image/"):
+                reply_text = handle_image_message(data, base, caption, sender_id=sender)
+            elif base.startswith("audio/"):
+                reply_text = handle_voice_message(data, base, sender_id=sender)
+            else:
+                reply_text = handle_document_message(
+                    data, media.get("filename", ""), base, caption, sender_id=sender)
+        _send_whatsapp_reply(sender, reply_text)
     elif sender and message_type is not None:
-        # A real message of a type we don't handle (video, document, location...) -
+        # A real message of a type we don't handle (video, location...) -
         # reply so the person knows the bot saw it, instead of silence that looks broken.
         logger.info(f"Unsupported message type '{message_type}' from {sender} — replying with guidance.")
-        _send_whatsapp_reply(sender, "כרגע אני מבין טקסט, תמונות והודעות קוליות. את זה אפשר לתאר במילים? 🙂")
+        _send_whatsapp_reply(sender, "כרגע אני מבין טקסט, תמונות, מסמכים והודעות קוליות. את זה אפשר לתאר במילים? 🙂")
     else:
         logger.info("Webhook event with no incoming message (status update, etc.) — ignored.")
 

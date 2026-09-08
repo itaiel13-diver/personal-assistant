@@ -38,6 +38,7 @@ from drive_tools import (
     trash_drive_file,
     update_drive_file,
 )
+import attachment_readers
 from media_tools import base_mime
 from todo_tools import (
     add_todo_checklist_item,
@@ -259,6 +260,11 @@ reports that Microsoft rejected the request, say so plainly - do not tell him a
 task was saved when the tool did not say it was.
 If the tools report the connection is not set up, tell him it needs one browser
 approval and offer to walk him through it; do not keep retrying.
+
+FILES HE SENDS IN WHATSAPP:
+- Documents arrive already read, marked [קובץ שאיתי שלח בוואטסאפ: name] with the extracted text inside. Answer from that text. If the marker says the file was cut after the first part, say so - never describe the rest of a file you did not receive.
+- When a mail carries a Google Drive/Docs/Sheets link (a share notification), open it with read_drive_file - the link itself works there. Never send such a link to read_web_page: the browser hits a login wall and learns nothing.
+- A Google Sheet is read with ALL its tabs. If he asks about a tab you cannot see in the text, say which tabs you do see instead of guessing.
 
 PICTURES AND VOICE MESSAGES:
 - Itai can now send photos: a display in a store, a price tag, a screen, a shelf. Look at the actual image before answering and answer from what is in it - never describe what you assume a photo shows.
@@ -712,6 +718,33 @@ def handle_image_message(image_bytes: bytes, mime_type: str, caption: str = "",
         logger.error(f"Gemini image call failed for sender {sender_id}: {e}")
         return "מצטער, יש כרגע תקלה זמנית ולא הצלחתי לראות את התמונה. נסה/י שוב בעוד רגע."
     return response.text or "לא הצלחתי לייצר תשובה לתמונה הזו. אפשר לנסח את זה קצת אחרת?"
+
+
+def handle_document_message(data: bytes, filename: str, mime_type: str, caption: str = "",
+                            sender_id: str = "default") -> str:
+    """Answers a file sent in WhatsApp by reading its text into the conversation.
+
+    WhatsApp's download URL is short-lived, so the file cannot be fetched again
+    later: what enters the conversation now is all there will ever be. That is
+    why the text goes in as one marked turn rather than staying "somewhere to
+    fetch from". A file longer than one part is cut after the first part, and
+    the marker says so plainly - the model must answer from what arrived rather
+    than promise the rest.
+
+    An unreadable file (old xls, scanned PDF, a zip) gets attachment_readers'
+    ready-made Hebrew explanation directly - the model adds nothing to it.
+    """
+    text = attachment_readers.extract_text(filename or "file", data, mime_type=mime_type)
+    if text.startswith("❌") or text.startswith("ה-PDF לא מכיל"):
+        return text
+    caption = (caption or "").strip()
+    header = f"[קובץ שאיתי שלח בוואטסאפ: {filename or 'ללא שם'}]"
+    if caption:
+        header += f"\n[הכיתוב שלו על הקובץ]: {caption}"
+    if "[חלק 1 מתוך" in text and "[זה החלק האחרון" not in text:
+        header += ("\n[הערה: הקובץ ארוך ונקטע אחרי החלק הראשון - ההורדה מוואטסאפ "
+                   "חד-פעמית, אז אי אפשר לשלוף את ההמשך מאוחר יותר. אמרי לו את זה.]")
+    return handle_whatsapp_message(f"{header}\n\n{text}", sender_id=sender_id)
 
 
 if __name__ == "__main__":

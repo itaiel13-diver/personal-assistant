@@ -319,3 +319,115 @@ def test_an_image_after_the_daily_quota_gets_an_honest_answer(fake_client, monke
     assert "מכסת" in reply
     assert "תמונות" in reply
     assistant._fallback_sessions.clear()
+
+
+# --- WhatsApp documents ----------------------------------------------------
+
+
+def _document_payload(sender: str, mime: str, filename: str, caption: str = None) -> dict:
+    payload = _media_payload(sender, "document", mime, caption)
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["document"]["filename"] = filename
+    return payload
+
+
+def test_a_document_is_downloaded_and_read_into_the_conversation(client):
+    raw = json.dumps(_document_payload("972500000000", "application/pdf",
+                                       "דוח.pdf", caption="מה מסקנות?")).encode()
+    with patch("webhook_server.media_tools.download_media",
+               return_value=(b"pdf-bytes", "application/pdf")), \
+         patch("webhook_server.handle_document_message", return_value="המסקנות...") as mock_handle, \
+         patch("webhook_server._send_whatsapp_reply") as mock_send:
+        r = client.post("/webhook", data=raw, content_type="application/json",
+                        headers={"X-Hub-Signature-256": _sign(raw)})
+    assert r.status_code == 200
+    mock_handle.assert_called_once_with(b"pdf-bytes", "דוח.pdf", "application/pdf",
+                                        "מה מסקנות?", sender_id="972500000000")
+    mock_send.assert_called_once_with("972500000000", "המסקנות...")
+
+
+def test_a_photo_sent_as_a_document_is_seen_as_a_photo(client):
+    """WhatsApp compresses photos; sending one 'as a document' keeps the
+    original - the bytes are an image whichever button he pressed."""
+    raw = json.dumps(_document_payload("972500000000", "image/png", "disp.png")).encode()
+    with patch("webhook_server.media_tools.download_media",
+               return_value=(b"png-bytes", "image/png")), \
+         patch("webhook_server.handle_image_message", return_value="רואה") as mock_image, \
+         patch("webhook_server.handle_document_message") as mock_doc, \
+         patch("webhook_server._send_whatsapp_reply"):
+        r = client.post("/webhook", data=raw, content_type="application/json",
+                        headers={"X-Hub-Signature-256": _sign(raw)})
+    assert r.status_code == 200
+    mock_image.assert_called_once()
+    mock_doc.assert_not_called()
+
+
+def test_a_failed_document_download_gets_a_reply(client):
+    raw = json.dumps(_document_payload("972500000000", "application/pdf", "x.pdf")).encode()
+    with patch("webhook_server.media_tools.download_media", return_value=(None, None)), \
+         patch("webhook_server.handle_document_message") as mock_doc, \
+         patch("webhook_server._send_whatsapp_reply") as mock_send:
+        r = client.post("/webhook", data=raw, content_type="application/json",
+                        headers={"X-Hub-Signature-256": _sign(raw)})
+    assert r.status_code == 200
+    mock_doc.assert_not_called()
+    assert "שוב" in mock_send.call_args[0][1]
+
+
+def test_a_document_its_reader_supports_enters_the_conversation(monkeypatch):
+    """WhatsApp's download URL is short-lived: the text must enter the
+    conversation now, marked with the filename, or it is gone for good."""
+    seen = {}
+    monkeypatch.setattr(assistant, "handle_whatsapp_message",
+                        lambda msg, sender_id="": seen.update(msg=msg) or "תשובה")
+    reply = assistant.handle_document_message("name,city\na,רמלה\n".encode("utf-8"), "סניפים.csv",
+                                              "text/csv", "", sender_id="s")
+    assert reply == "תשובה"
+    assert "סניפים.csv" in seen["msg"]
+    assert "רמלה" in seen["msg"]
+
+
+def test_a_document_its_reader_cannot_handle_gets_the_ready_made_explanation(monkeypatch):
+    """attachment_readers' refusal is already user-ready Hebrew - passing it
+    through the model would only rephrase an explanation at token cost."""
+    called = []
+    monkeypatch.setattr(assistant, "handle_whatsapp_message",
+                        lambda *a, **k: called.append(a) or "x")
+    reply = assistant.handle_document_message(b"PK", "מצגת.pptx", "application/x", "", sender_id="s")
+    assert not called
+    assert "מצגת" in reply or "❌" in reply
+
+
+def test_a_long_document_says_it_was_cut(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(assistant, "handle_whatsapp_message",
+                        lambda msg, sender_id="": seen.update(msg=msg) or "ok")
+    long_text = "\n".join(f"שורה {i} עם קצת תוכן כדי למלא" for i in range(2000))
+    import attachment_readers
+    monkeypatch.setattr(attachment_readers, "extract_text",
+                        lambda *a, **k: f"[חלק 1 מתוך 4]\n{long_text[:100]}\n\n[סוף חלק 1. יש עוד 3 חלקים.]")
+    assistant.handle_document_message(b"x", "גדול.csv", "text/csv", "", sender_id="s")
+    assert "נקטע" in seen["msg"]
+
+
+# --- multi-tab spreadsheets (the Drive export fix, proven end to end) -------
+
+
+def test_a_two_sheet_workbook_reads_both_tabs():
+    """What the xlsx export buys: the second tab is data, not silence."""
+    import io
+    from openpyxl import Workbook
+    import attachment_readers
+
+    wb = Workbook()
+    wb.active.title = "ינואר"
+    wb.active.append(["סניף", "מכירות"])
+    wb.active.append(["רמלה", 10])
+    second = wb.create_sheet("פברואר")
+    second.append(["סניף", "מכירות"])
+    second.append(["לוד", 20])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    text = attachment_readers.extract_text("מכירות.xlsx", buf.getvalue())
+    assert "ינואר" in text and "פברואר" in text
+    assert "רמלה" in text and "לוד" in text

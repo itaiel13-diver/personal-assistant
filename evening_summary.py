@@ -36,6 +36,9 @@ Three deliberate data-source choices:
   Excellence app (portfolio.py). His broker offers no public API to retail
   clients - verified 2026-09-08 - so the stored export plus stooq's free
   prices is the source of truth.
+- Crypto arrives by chat, not by export (portfolio.py), and is priced from
+  CoinGecko's free JSON API in USD: a structured feed, no key, and the coin's
+  line keeps its dollars to itself - never folded into the shekel holdings.
 - STOCK_SYMBOLS (stooq symbols such as NVDA.US) remains the fallback for
   when no export was ever given. An empty everything is not hidden: the
   summary asks him for his holdings instead of inventing numbers.
@@ -59,6 +62,7 @@ SUMMARY_AT = time(20, 0)
 
 FOOTBALL_URL = "https://www.thesportsdb.com/api/v1/json/3/eventsday.php"
 STOOQ_URL = "https://stooq.com/q/l/"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 
 HTTP_TIMEOUT = 15
 
@@ -204,6 +208,37 @@ def _stooq_quotes(symbols: list) -> dict:
     return quotes
 
 
+def _coingecko_quotes(coin_ids: list) -> dict:
+    """One call for every coin: {id: {"price": float|None, "change_24h":
+    float|None}}, prices in USD. A coin the API did not return stays in the
+    map with None prices, and a dead API returns {} - either way the review
+    says there is no live quote rather than guessing one."""
+    if not coin_ids:
+        return {}
+    try:
+        resp = requests.get(
+            COINGECKO_URL,
+            params={"ids": ",".join(coin_ids), "vs_currencies": "usd",
+                    "include_24hr_change": "true"},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json() or {}
+    except Exception as e:
+        logger.error(f"Crypto fetch failed for {coin_ids}: {e}")
+        return {}
+
+    def number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {cid: {"price": number((data.get(cid) or {}).get("usd")),
+                  "change_24h": number((data.get(cid) or {}).get("usd_24h_change"))}
+            for cid in coin_ids}
+
+
 def fetch_stocks(symbols: list) -> list:
     """The fallback watchlist as display lines: last close and the day's
     move from open."""
@@ -225,11 +260,15 @@ def fetch_stocks(symbols: list) -> list:
 
 def stocks_section() -> list:
     """The portfolio review when Itai handed one over, else the configured
-    watchlist. Every number in either comes from the export or the feed."""
+    watchlist. Every number in either comes from the export or the feeds:
+    stooq for the securities, CoinGecko for the coins."""
     holdings = portfolio.load_holdings()
     if holdings:
         symbols = [s for s in (portfolio.stooq_symbol(h) for h in holdings) if s]
-        return portfolio.review_lines(holdings, _stooq_quotes(symbols))
+        coin_ids = [h["coingecko_id"] for h in holdings
+                    if h.get("kind") == "crypto" and h.get("coingecko_id")]
+        return portfolio.review_lines(
+            holdings, _stooq_quotes(symbols), _coingecko_quotes(coin_ids))
     return fetch_stocks(stock_symbols())
 
 

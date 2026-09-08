@@ -279,3 +279,48 @@ def test_without_a_portfolio_the_watchlist_is_the_fallback():
          patch.object(es, "fetch_stocks", return_value=["NVDA.US: 175.1"]) as watch:
         assert es.stocks_section() == ["NVDA.US: 175.1"]
     watch.assert_called_once()
+
+
+
+def test_a_crypto_holding_is_priced_from_coingecko():
+    import portfolio
+    holdings = [{"kind": "crypto", "coingecko_id": "bitcoin", "symbol": "BTC",
+                 "name": "ביטקוין (BTC)", "quantity": 0.35}]
+    resp = MagicMock()
+    resp.json.return_value = {"bitcoin": {"usd": 80000, "usd_24h_change": -1.2}}
+    resp.raise_for_status.return_value = None
+    with patch.object(portfolio, "load_holdings", return_value=holdings), \
+         patch.object(es.requests, "get", return_value=resp):
+        lines = es.stocks_section()
+    assert "$80,000" in lines[0] and "-1.2% ב-24 השעות" in lines[0]
+
+
+def test_a_coingecko_failure_is_reported_not_hidden():
+    import portfolio
+    holdings = [{"kind": "crypto", "coingecko_id": "bitcoin", "symbol": "BTC",
+                 "name": "ביטקוין (BTC)", "quantity": 0.35}]
+    with patch.object(portfolio, "load_holdings", return_value=holdings), \
+         patch.object(es.requests, "get", side_effect=RuntimeError("down")):
+        lines = es.stocks_section()
+    assert "אין מחיר חי" in lines[0]
+
+
+def test_a_mixed_portfolio_prices_each_side_from_its_own_feed():
+    import portfolio
+    holdings = [
+        {"name": "NVIDIA", "symbol": "NVDA", "quantity": 10, "cost": 150.0},
+        {"kind": "crypto", "coingecko_id": "bitcoin", "symbol": "BTC",
+         "name": "ביטקוין (BTC)", "quantity": 0.35},
+    ]
+    with patch.object(portfolio, "load_holdings", return_value=holdings), \
+         patch.object(es, "_stooq_quotes",
+                      return_value={"NVDA.US": {"close": 175.0, "open": 170.0}}) as stooq, \
+         patch.object(es, "_coingecko_quotes",
+                      return_value={"bitcoin": {"price": 80000.0,
+                                                "change_24h": 1.5}}) as gecko:
+        lines = es.stocks_section()
+    stooq.assert_called_once_with(["NVDA.US"])
+    gecko.assert_called_once_with(["bitcoin"])
+    assert lines[0].startswith("NVIDIA (NVDA.US): 175")
+    assert lines[1].startswith("ביטקוין (BTC): $80,000")
+

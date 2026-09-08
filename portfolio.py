@@ -10,7 +10,9 @@ parser is built around Hebrew header words, not fixed columns: it finds the
 header row by looking for a name column and a quantity column, maps the
 rest by synonyms, and reads rows until they run out. A file that does not
 look like a holdings export returns None and the caller treats it as an
-ordinary document.
+ordinary document. The export's own שווי אחזקה column is kept too: for a
+security with no live feed it is the last value anyone actually stated, so
+the review shows it - dated to the report, never as a live number.
 
 Pricing is honest about its limits. stooq's free feed knows US and global
 tickers, so a holding whose symbol looks like one (letters, short) is
@@ -18,6 +20,16 @@ priced as SYMBOL.US. An Israeli security number (נייר ערך מספר ...) h
 free feed the bot can reach - it is listed with its quantity and cost and
 marked as having no live quote. A missing price is reported, never
 invented, and percentages never mix currencies into a made-up total.
+
+Bitcoin never appears in that export at all, so it arrives by chat instead:
+"יש לי 0.35 ביטקוין" is parsed in code (never by the model - a misheard
+amount would poison the daily review), stored as a holding with
+kind="crypto", and priced once a day from CoinGecko's free JSON API - a
+structured feed, so the number cannot be remembered either. Two things stay
+unknown on purpose: the cost basis (until he gives one) and the currency mix
+(coins are priced in USD, the export in shekels) - the review says "עלות לא
+ידועה" and never folds dollars into the shekel lines. A fresh Excellence
+export replaces only the export's own rows; crypto holdings survive it.
 """
 import io
 import logging
@@ -37,6 +49,7 @@ _SYMBOL_WORDS = ("מספר נייר", "מס' נייר", "סמל", "סימבול"
 _QUANTITY_WORDS = ("כמות", "יחידות", "quantity")
 _COST_WORDS = ("מחיר עלות", "שער עלות", "עלות ממוצעת", "עלות", "מחיר קנייה", "שער קנייה")
 _PRICE_WORDS = ("שער אחרון", "מחיר נוכחי", "שער נוכחי", "שער", "מחיר")
+_VALUE_WORDS = ("שווי אחזקה", "שווי החזקה", "שווי נייר", "שווי", "value")
 
 MAX_HEADER_SCAN_ROWS = 20
 
@@ -77,6 +90,7 @@ def _match_column(header: str):
         ("quantity", _QUANTITY_WORDS),
         ("cost", _COST_WORDS),
         ("price", _PRICE_WORDS),
+        ("value", _VALUE_WORDS),
     ):
         if any(w in h for w in words):
             return field
@@ -137,7 +151,8 @@ def parse_export(filename: str, data: bytes) -> list | None:
             continue
         holding = {"name": name}
         for field, clean in (("symbol", str), ("quantity", _clean_number),
-                             ("cost", _clean_number), ("price", _clean_number)):
+                             ("cost", _clean_number), ("price", _clean_number),
+                             ("value", _clean_number)):
             index = columns_by(columns, field)
             if index is None or index >= len(row):
                 continue
@@ -167,6 +182,8 @@ def stooq_symbol(holding: dict) -> str | None:
     'NVDA' prices as NVDA.US; 'NVDA.US' stays as is. An Israeli security
     number is digits, and digits are not a ticker stooq knows - None, and
     the review says there is no live quote instead of guessing."""
+    if holding.get("kind") == "crypto":
+        return None
     raw = (holding.get("symbol") or "").strip().upper()
     if not raw:
         return None
@@ -177,19 +194,53 @@ def stooq_symbol(holding: dict) -> str | None:
     return None
 
 
-def review_lines(holdings: list, closes: dict) -> list:
+def review_lines(holdings: list, closes: dict, crypto_quotes: dict | None = None) -> list:
     """The daily review as display lines: per holding, the day's move and the
     move since cost; then the count of risers and fallers.
 
-    closes maps a stooq symbol to {"close": float|None, "open": float|None}.
-    Pure and total in what it shows: every number comes from the export or
-    from the feed it was handed, and a holding without a live quote says so.
+    closes maps a stooq symbol to {"close": float|None, "open": float|None};
+    crypto_quotes maps a CoinGecko id to {"price": float|None, "change_24h":
+    float|None}, in USD. Pure and total in what it shows: every number comes
+    from the export or from the feeds it was handed, a holding without a live
+    quote says so, and a coin whose cost was never given says "עלות לא ידועה"
+    instead of inventing a gain. Dollars stay inside the coin's own line -
+    they are never folded into a shekel total.
     """
+    crypto_quotes = crypto_quotes or {}
     lines = []
     up_today = down_today = 0
     gainers = losers = 0
     for h in holdings:
         name = h.get("name", "?")
+        if h.get("kind") == "crypto":
+            quote = crypto_quotes.get(h.get("coingecko_id")) or {}
+            price = quote.get("price")
+            change = quote.get("change_24h")
+            quantity = h.get("quantity")
+            cost = h.get("cost")
+            if price is None:
+                detail = f"{quantity:g} יח'" if quantity is not None else ""
+                suffix = f" ({detail})" if detail else ""
+                lines.append(f"{name}: אין מחיר חי{suffix}")
+                continue
+            parts = [f"${price:,.0f}"]
+            if change is not None:
+                parts.append(f"{change:+.1f}% ב-24 השעות")
+                up_today += change > 0
+                down_today += change < 0
+            if quantity is not None:
+                parts.append(f"שווי ≈ ${price * quantity:,.0f}")
+            if cost and h.get("cost_currency") == "USD":
+                since = (price - cost) / cost * 100
+                parts.append(f"{since:+.1f}% מהעלות")
+                gainers += since > 0
+                losers += since < 0
+            elif cost:
+                parts.append(f"עלות {cost:g} (מטבע לא ידוע)")
+            else:
+                parts.append("עלות לא ידועה")
+            lines.append(f"{name}: {', '.join(parts)}")
+            continue
         symbol = stooq_symbol(h)
         quote = closes.get(symbol) if symbol else None
         close = (quote or {}).get("close")
@@ -202,6 +253,10 @@ def review_lines(holdings: list, closes: dict) -> list:
                 detail.append(f"{quantity:g} יח'")
             if cost is not None:
                 detail.append(f"עלות {cost:g}")
+            if h.get("value") is not None:
+                # The export's own שווי אחזקה: the value as of the report's
+                # day, never refreshed - said as such, not as a live number.
+                detail.append(f'שווי אחרון מהדו"ח {h["value"]:g}')
             suffix = f" ({', '.join(detail)})" if detail else ""
             lines.append(f"{name}: אין מחיר חי{suffix}")
             continue
@@ -237,14 +292,118 @@ def import_export(filename: str, data: bytes) -> str | None:
         return None
     if not holdings:
         return None
-    if not storage.save_portfolio(holdings, source=filename or ""):
+    kept = [h for h in load_holdings() if h.get("kind") == "crypto"]
+    if not storage.save_portfolio(holdings + kept, source=filename or ""):
         return ("❌ זיהיתי שזה דו\"ח תיק מאקסלנס, אבל אין לי מסד נתונים פעיל "
                 "כדי לשמור אותו. תגיד לאיתי לבדוק את DATABASE_URL.")
     names = ", ".join(h["name"] for h in holdings[:6])
     more = f" ועוד {len(holdings) - 6}" if len(holdings) > 6 else ""
-    return (
+    message = (
         f"✅ התיק נשמר - {len(holdings)} החזקות: {names}{more}.\n"
         "מכאן אני בודק אותו בעצמי כל ערב בסיכום: מושך מחירים עדכניים ומחשב "
         "מה עלה ומה ירד, בלי שתצטרך לשלוח שוב. ניירות ישראליים בלי סמל "
         "גלובלי יופיעו בלי מחיר חי - אין להם מקור חינמי שאני יכול להגיע אליו."
     )
+    if kept:
+        message += (f"\n{len(kept)} החזקות הקריפטו שנרשמו בצ'אט נשמרו "
+                    "ולא נמחקו.")
+    return message
+
+
+# --- crypto by chat -----------------------------------------------------------
+#
+# The Excellence export has no coin rows, so a coin holding arrives as a chat
+# message ("יש לי 0.35 ביטקוין") and is parsed here, in code. Only an explicit
+# possession or update phrase counts: a price question or a passing mention of
+# bitcoin must never write to the portfolio.
+
+COINGECKO_IDS = {"bitcoin": "BTC"}
+_COIN_NAMES_HE = {"bitcoin": "ביטקוין"}
+
+# Longer aliases first, so "ביטקוינים" wins over its own prefix.
+_COIN_ALIASES = {
+    "ביטקוינים": "bitcoin",
+    "ביטקוין": "bitcoin",
+    "bitcoin": "bitcoin",
+    "btc": "bitcoin",
+    "₿": "bitcoin",
+}
+
+_CRYPTO_INTENT = ("יש לי", "לי יש", "יש ברשותי", "מחזיק", "קניתי", "הוספתי",
+                  "להוסיף", "תוסיף", "תרשום", "לרשום", "עדכן", "i have",
+                  "i own", "add ")
+
+_AMOUNT = r"([\d,]+(?:\.\d+)?)"
+
+
+def parse_crypto_message(text: str) -> dict | None:
+    """A coin holding stated in chat, or None.
+
+    The amount is required to sit next to the coin's name, and the message to
+    carry a possession/update phrase - both, not either."""
+    t = " " + " ".join((text or "").lower().split()) + " "
+    if not t.strip() or not any(w in t for w in _CRYPTO_INTENT):
+        return None
+    for alias, coin_id in _COIN_ALIASES.items():
+        a = re.escape(alias)
+        m = (re.search(_AMOUNT + r"\s*(?:יח'?\s*)?" + a, t)
+             or re.search(a + r"\s*(?:של\s*)?" + _AMOUNT, t))
+        if not m:
+            continue
+        parsed = {"coin_id": coin_id,
+                  "quantity": float(m.group(1).replace(",", ""))}
+        cost = re.search(r"(?:עלות|במחיר|קניתי\s+ב)\s*-?\s*" + _AMOUNT, t)
+        if cost:
+            parsed["cost"] = float(cost.group(1).replace(",", ""))
+            if "$" in t or "דולר" in t:
+                parsed["cost_currency"] = "USD"
+            elif "₪" in t or "שקל" in t or 'ש"ח' in t:
+                parsed["cost_currency"] = "ILS"
+        return parsed
+    return None
+
+
+def upsert_crypto(coin_id: str, quantity: float, cost=None,
+                  cost_currency=None) -> str:
+    """Store or replace one coin holding, keeping everything else in the
+    portfolio - including the Excellence export's rows - untouched."""
+    holdings = [h for h in load_holdings() if h.get("coingecko_id") != coin_id]
+    symbol = COINGECKO_IDS.get(coin_id, coin_id.upper())
+    name_he = _COIN_NAMES_HE.get(coin_id, coin_id)
+    holding = {"kind": "crypto", "coingecko_id": coin_id, "symbol": symbol,
+               "name": f"{name_he} ({symbol})", "quantity": quantity}
+    if cost is not None:
+        holding["cost"] = cost
+        if cost_currency:
+            holding["cost_currency"] = cost_currency
+    holdings.append(holding)
+    if not storage.save_portfolio(holdings, source="whatsapp-chat"):
+        return ("❌ זיהיתי החזקת קריפטו, אבל אין לי מסד נתונים פעיל כדי "
+                "לשמור אותה. תגיד לאיתי לבדוק את DATABASE_URL.")
+    lines = [f"✅ נרשם בתיק: {quantity:g} {symbol} ({name_he}).",
+             "כל ערב בסיכום אמשוך את המחיר העדכני מ-CoinGecko בדולרים ואציג "
+             "שווי ותנועה יומית."]
+    if cost is not None and cost_currency == "USD":
+        lines.append(f"רשמתי גם עלות של ${cost:g} - אחשב גם רווח/הפסד מהעלות.")
+    elif cost is not None:
+        lines.append(f"רשמתי עלות {cost:g}, אבל המטבע לא ברור ולא ניתן "
+                     "להשוות למחיר הדולרי - אציג אותה בלי חישוב רווח/הפסד.")
+    else:
+        lines.append("מחיר העלות לא ידוע לי, אז אכתוב 'עלות לא ידועה' ולא "
+                     "אמציא רווח או הפסד. אם תשלח גם את מחיר הקנייה בדולרים - "
+                     "אחשב.")
+    return "\n".join(lines)
+
+
+def handle_crypto_message(text: str) -> str | None:
+    """Store a coin holding stated in chat and confirm it in Hebrew, or None
+    when the message is not one."""
+    parsed = parse_crypto_message(text)
+    if not parsed:
+        return None
+    try:
+        return upsert_crypto(**parsed)
+    except Exception as e:
+        logger.error(f"Crypto holding save failed: {e}")
+        return "❌ משהו השתבש בשמירת ההחזקה. נסה שוב בעוד רגע."
+

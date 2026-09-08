@@ -86,6 +86,18 @@ def test_a_symbol_the_feed_does_not_know_is_reported_not_dropped():
     assert "אין מחיר חי" in lines[0]
 
 
+def test_the_exports_value_column_is_kept_and_shown_for_unpriced_holdings():
+    rows = [
+        ['שם נייר', 'מספר נייר', 'כמות', 'מחיר עלות', 'שער אחרון', 'שווי אחזקה'],
+        ['טבע', '693014', 100, 40.5, 41.0, 4100.0],
+    ]
+    holdings = portfolio.parse_export("תיק.xlsx", _xlsx(rows))
+    assert holdings[0]["value"] == 4100.0
+    lines = portfolio.review_lines(holdings, {})
+    assert "אין מחיר חי" in lines[0]
+    assert 'שווי אחרון מהדו"ח 4100' in lines[0]
+
+
 def test_import_stores_the_export_and_confirms_in_hebrew():
     saved = {}
     with patch.object(portfolio.storage, "save_portfolio",
@@ -105,3 +117,93 @@ def test_without_a_database_the_import_says_so():
     with patch.object(portfolio.storage, "save_portfolio", return_value=False):
         out = portfolio.import_export("תיק.xlsx", _xlsx(EXCELLENCE_LIKE))
     assert out.startswith("❌") and "DATABASE_URL" in out
+
+
+
+# --- crypto by chat -----------------------------------------------------------
+
+BTC_HOLDING = {"kind": "crypto", "coingecko_id": "bitcoin", "symbol": "BTC",
+               "name": "ביטקוין (BTC)", "quantity": 0.35}
+
+
+def test_a_bitcoin_holding_is_parsed_from_chat():
+    assert portfolio.parse_crypto_message("ויש לי גם 0.35 btc") == \
+        {"coin_id": "bitcoin", "quantity": 0.35}
+    assert portfolio.parse_crypto_message("יש לי 0.35 ביטקוין")["quantity"] == 0.35
+    assert portfolio.parse_crypto_message("אני מחזיק 2 ביטקוין")["quantity"] == 2.0
+    assert portfolio.parse_crypto_message("add 0.5 bitcoin")["quantity"] == 0.5
+
+
+def test_a_mention_without_possession_is_not_a_holding():
+    assert portfolio.parse_crypto_message("מה המחיר של ביטקוין היום?") is None
+    assert portfolio.parse_crypto_message("0.35 btc") is None
+    assert portfolio.parse_crypto_message("שמעת על הביטקוין?") is None
+
+
+def test_cost_and_currency_are_captured_only_when_stated():
+    p = portfolio.parse_crypto_message("יש לי 0.35 ביטקוין שקניתי ב-60,000 דולר")
+    assert p["cost"] == 60000.0 and p["cost_currency"] == "USD"
+    p = portfolio.parse_crypto_message("יש לי 0.35 ביטקוין בעלות 60000")
+    assert p["cost"] == 60000.0 and "cost_currency" not in p
+
+
+def test_crypto_upsert_keeps_the_export_rows():
+    stored = [{"name": "NVIDIA", "symbol": "NVDA", "quantity": 10.0}]
+    saved = {}
+    with patch.object(portfolio, "load_holdings", return_value=stored), \
+         patch.object(portfolio.storage, "save_portfolio",
+                      side_effect=lambda h, source="": saved.update(holdings=h) or True):
+        out = portfolio.handle_crypto_message("יש לי 0.35 ביטקוין")
+    assert out.startswith("✅") and "עלות לא ידועה" in out
+    assert saved["holdings"][0]["name"] == "NVIDIA"
+    crypto = saved["holdings"][1]
+    assert crypto["kind"] == "crypto" and crypto["quantity"] == 0.35
+    assert crypto["coingecko_id"] == "bitcoin"
+
+
+def test_a_second_bitcoin_message_replaces_the_first():
+    saved = {}
+    with patch.object(portfolio, "load_holdings", return_value=[dict(BTC_HOLDING)]), \
+         patch.object(portfolio.storage, "save_portfolio",
+                      side_effect=lambda h, source="": saved.update(holdings=h) or True):
+        portfolio.handle_crypto_message("יש לי 0.5 ביטקוין")
+    assert len(saved["holdings"]) == 1
+    assert saved["holdings"][0]["quantity"] == 0.5
+
+
+def test_a_fresh_excel_import_preserves_crypto():
+    saved = {}
+    with patch.object(portfolio, "load_holdings", return_value=[dict(BTC_HOLDING)]), \
+         patch.object(portfolio.storage, "save_portfolio",
+                      side_effect=lambda h, source="": saved.update(holdings=h) or True):
+        out = portfolio.import_export("תיק.xlsx", _xlsx(EXCELLENCE_LIKE))
+    kinds = [h.get("kind") for h in saved["holdings"]]
+    assert kinds == [None, None, "crypto"]
+    assert "קריפטו" in out
+
+
+def test_crypto_is_never_mapped_to_a_stooq_symbol():
+    assert portfolio.stooq_symbol({"kind": "crypto", "symbol": "BTC"}) is None
+
+
+def test_the_review_prices_a_coin_from_the_feed_it_was_handed():
+    lines = portfolio.review_lines(
+        [dict(BTC_HOLDING)], {},
+        {"bitcoin": {"price": 80000.0, "change_24h": 1.5}})
+    assert lines[0] == ("ביטקוין (BTC): $80,000, +1.5% ב-24 השעות, "
+                        "שווי ≈ $28,000, עלות לא ידועה")
+
+
+def test_a_coin_without_a_quote_says_so_and_a_usd_cost_is_compared():
+    lines = portfolio.review_lines([dict(BTC_HOLDING)], {}, {})
+    assert "אין מחיר חי" in lines[0] and "0.35 יח'" in lines[0]
+    with_cost = dict(BTC_HOLDING, cost=40000.0, cost_currency="USD")
+    lines = portfolio.review_lines(
+        [with_cost], {}, {"bitcoin": {"price": 80000.0, "change_24h": -2.0}})
+    assert "+100.0% מהעלות" in lines[0]
+    unknown_ccy = dict(BTC_HOLDING, cost=40000.0)
+    lines = portfolio.review_lines(
+        [unknown_ccy], {}, {"bitcoin": {"price": 80000.0, "change_24h": None}})
+    assert "עלות 40000 (מטבע לא ידוע)" in lines[0]
+    assert "מהעלות" not in lines[0]
+

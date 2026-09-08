@@ -1,0 +1,107 @@
+"""Tests for the portfolio Itai hands over once and the bot reviews daily.
+
+What is being protected: the parser recognises an Excellence holdings export
+by its Hebrew headers without breaking on an ordinary spreadsheet, a holding
+with no reachable live price is reported as such and never given an invented
+number, and storing replaces the old export whole so a fresh one is the
+truth from that evening on.
+"""
+import io
+import os
+import sys
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import portfolio
+
+
+def _xlsx(rows):
+    import openpyxl
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    for row in rows:
+        sheet.append(row)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+EXCELLENCE_LIKE = [
+    ['דו"ח תיק השקעות', None, None, None, None],
+    ['שם נייר', 'מספר נייר', 'כמות', 'מחיר עלות', 'שער אחרון'],
+    ['NVIDIA', 'NVDA', 10, 150.0, 175.1],
+    ['טבע', '693014', 100, 40.5, 41.0],
+]
+
+
+def test_an_excellence_export_is_parsed_by_its_hebrew_headers():
+    holdings = portfolio.parse_export("תיק.xlsx", _xlsx(EXCELLENCE_LIKE))
+    assert len(holdings) == 2
+    assert holdings[0] == {"name": "NVIDIA", "symbol": "NVDA",
+                           "quantity": 10.0, "cost": 150.0, "price": 175.1}
+    assert holdings[1]["name"] == "טבע" and holdings[1]["quantity"] == 100.0
+
+
+def test_an_ordinary_spreadsheet_is_not_a_portfolio():
+    data = _xlsx([["תאריך", "סניף", "הערות"], ["08/09", "יבנה", "VOC"]])
+    assert portfolio.parse_export("voc.xlsx", data) is None
+
+
+def test_only_spreadsheets_are_even_parsed():
+    assert portfolio.looks_like_export("תיק.xlsx")
+    assert portfolio.looks_like_export("export.csv")
+    assert not portfolio.looks_like_export("מסמך.pdf")
+
+
+def test_numbers_survive_commas_shekel_signs_and_parentheses():
+    assert portfolio._clean_number("1,234.5 ₪") == 1234.5
+    assert portfolio._clean_number("(12.0)") == -12.0
+    assert portfolio._clean_number("אין") is None
+
+
+def test_a_us_ticker_maps_to_stooq_and_an_israeli_number_does_not():
+    assert portfolio.stooq_symbol({"symbol": "NVDA"}) == "NVDA.US"
+    assert portfolio.stooq_symbol({"symbol": "NVDA.US"}) == "NVDA.US"
+    assert portfolio.stooq_symbol({"symbol": "693014"}) is None
+    assert portfolio.stooq_symbol({"name": "x"}) is None
+
+
+def test_the_review_shows_the_days_move_and_the_move_since_cost():
+    holdings = [
+        {"name": "NVIDIA", "symbol": "NVDA", "quantity": 10, "cost": 150.0},
+        {"name": "טבע", "symbol": "693014", "quantity": 100, "cost": 40.5},
+    ]
+    lines = portfolio.review_lines(holdings, {"NVDA.US": {"close": 175.0, "open": 170.0}})
+    assert lines[0] == "NVIDIA (NVDA.US): 175, +2.9% היום, +16.7% מהעלות"
+    assert "טבע" in lines[1] and "אין מחיר חי" in lines[1]
+    assert "1 עלו" in lines[2] and "1 ברווח" in lines[2]
+
+
+def test_a_symbol_the_feed_does_not_know_is_reported_not_dropped():
+    lines = portfolio.review_lines(
+        [{"name": "דמיונית", "symbol": "FAKE", "quantity": 1, "cost": 1.0}],
+        {"FAKE.US": {"close": None, "open": None}},
+    )
+    assert "אין מחיר חי" in lines[0]
+
+
+def test_import_stores_the_export_and_confirms_in_hebrew():
+    saved = {}
+    with patch.object(portfolio.storage, "save_portfolio",
+                      side_effect=lambda h, source="": saved.update(holdings=h) or True):
+        out = portfolio.import_export("תיק.xlsx", _xlsx(EXCELLENCE_LIKE))
+    assert out.startswith("✅") and "2 החזקות" in out
+    assert saved["holdings"][0]["name"] == "NVIDIA"
+
+
+def test_import_of_a_non_export_returns_none_and_stores_nothing():
+    with patch.object(portfolio.storage, "save_portfolio") as save:
+        assert portfolio.import_export("voc.xlsx", _xlsx([["א", "ב"]])) is None
+    save.assert_not_called()
+
+
+def test_without_a_database_the_import_says_so():
+    with patch.object(portfolio.storage, "save_portfolio", return_value=False):
+        out = portfolio.import_export("תיק.xlsx", _xlsx(EXCELLENCE_LIKE))
+    assert out.startswith("❌") and "DATABASE_URL" in out

@@ -41,9 +41,13 @@ The three rules this module keeps:
      otherwise. Deletion is destructive but private and undoable; sharing is
      neither, because a document read by the wrong person cannot be unread.
      This one stays until Itai asks for it by name.
-  3. It only writes inside DRIVE_FOLDER_ID. New files are created there, and an
-     edit is refused unless the file is already in that folder. Everything
-     outside it is readable and not writable.
+  3. Inside DRIVE_FOLDER_ID and every folder under it the assistant has full
+     freedom - create, edit, append, rename, move, bin and delete - without
+     asking first, because that tree is its own workspace and the bin keeps
+     a mistake recoverable for 30 days. Itai's words, 2026-09-08: inside the
+     target folder the permissions are unlimited. The bot's own identity
+     (the service account) may WRITE there too, and only there. Everything
+     outside the tree stays readable and not writable, for both identities.
 
   4. It never edits or deletes a file that anyone besides Itai and the bot
      can see, unless Itai has approved that exact change in the conversation.
@@ -183,9 +187,12 @@ def _drive_service():
 # click - see docs/STATUS.md.
 SA_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-# Widened for the single write described above. Kept as its own constant and
-# its own builder so the read path stays provably read-only, and so a test can
-# fail any code that reaches for this object from anywhere but the mirror.
+# Widened for two write paths, and only those: the mirror's addParents call,
+# and _mutation_identity taking over a change INSIDE the working folder tree
+# when the file is one only the bot can see (a shortcut it filed, a file
+# shared with its address alone). Kept as its own constant and its own
+# builder so the read path stays provably read-only, and so a test can fail
+# any code that reaches for this object from anywhere but those two.
 SA_WRITE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 _sa_service = None
@@ -220,7 +227,8 @@ def _sa_drive_service():
 
 def _sa_write_drive_service():
     """Drive as the bot itself, with the write scope. Exists for the mirror's
-    addParents call and nothing else - see the comment above SA_WRITE_SCOPES."""
+    addParents call and for mutations _mutation_identity has already confined
+    to the working folder tree - see the comment above SA_WRITE_SCOPES."""
     global _sa_write_service
     if _sa_write_service is None:
         raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
@@ -317,13 +325,6 @@ def _extract_file_id(value: str) -> str:
     if match:
         return match.group(1)
     return value
-
-def _parents(file_id: str) -> list:
-    meta = _drive_service().files().get(
-        fileId=file_id, fields="parents", supportsAllDrives=True
-    ).execute()
-    return meta.get("parents") or []
-
 
 def _third_party_access(file_id: str, service, meta: dict | None = None):
     """Who besides Itai and the bot can open this file.
@@ -425,6 +426,73 @@ def _working_parent(folder_id: str) -> str:
             return ""
         current = parents[0]
     return ""
+
+
+def _inside_working_tree(service, parents: list) -> bool:
+    """True when a file whose direct parents are given lives in the working
+    folder or a folder under it. Same walk _working_parent does for a
+    destination, from the other direction: the file's ancestry is climbed
+    until the working folder shows up or the trail ends. An unset working
+    folder means no tree at all, and a climb that fails means unknown - and
+    unknown is outside, because a write that cannot prove its place is not
+    made."""
+    if not FOLDER_ID:
+        return False
+    pending = list(parents or [])
+    seen = set()
+    for _ in range(MAX_FOLDER_DEPTH + 1):
+        if FOLDER_ID in pending:
+            return True
+        nxt = [p for p in pending if p not in seen]
+        if not nxt:
+            return False
+        seen.update(nxt)
+        pending = []
+        for folder in nxt:
+            try:
+                meta = service.files().get(
+                    fileId=folder, fields="parents", supportsAllDrives=True
+                ).execute()
+            except Exception as e:
+                logger.error(f"Folder ancestry check failed for {folder!r}: {e}")
+                continue
+            pending.extend(meta.get("parents") or [])
+    return False
+
+
+_MUTATION_META_FIELDS = ("name, mimeType, parents, ownedByMe, trashed, "
+                         "permissions(emailAddress,role,type,domain,displayName)")
+
+
+def _mutation_identity(file_id: str):
+    """Which identity may change this file, and the file's metadata.
+
+    Itai's OAuth answers first. When his identity cannot even see the file -
+    a shortcut the bot filed and owns, something shared with the bot's
+    address alone - the bot's own write identity takes over, scoped by the
+    caller to the working folder tree: inside the tree the bot may change
+    what it can see, and outside the tree its write scope is never used.
+    Every caller still walks _inside_working_tree and _check_shared_edit
+    before touching anything.
+
+    Returns (service, meta). Raises when neither identity can see the file.
+    """
+    service = _drive_service()
+    try:
+        meta = service.files().get(
+            fileId=file_id, fields=_MUTATION_META_FIELDS, supportsAllDrives=True
+        ).execute()
+        return service, meta
+    except Exception as e:
+        if not _is_missing(e):
+            raise
+    if not _sa_email():
+        raise
+    service = _sa_write_drive_service()
+    meta = service.files().get(
+        fileId=file_id, fields=_MUTATION_META_FIELDS, supportsAllDrives=True
+    ).execute()
+    return service, meta
 
 
 def _refuse_write(reason: str) -> str:
@@ -864,17 +932,12 @@ def update_drive_file(file_id: str, content: str,
 
     logger.info(f"Drive tool: update_drive_file(file_id={file_id!r})")
     try:
-        if FOLDER_ID not in _parents(file_id):
+        service, meta = _mutation_identity(file_id)
+        if not _inside_working_tree(service, meta.get("parents")):
             return _refuse_write(
                 "הקובץ הזה לא נמצא בתיקיית העבודה, ולכן אני יכול רק לקרוא אותו ולא לשנות אותו. "
                 "אם צריך לערוך אותו — אפשר שאיצור עותק חדש בתיקיית העבודה."
             )
-        service = _drive_service()
-        meta = service.files().get(
-            fileId=file_id,
-            fields="mimeType, name, permissions(emailAddress,role,type,domain,displayName)",
-            supportsAllDrives=True,
-        ).execute()
         refusal = _check_shared_edit(file_id, service, confirmed_shared_edit, meta)
         if refusal:
             return _refuse_write(refusal)
@@ -929,16 +992,11 @@ def append_drive_file(file_id: str, content: str,
 
     logger.info(f"Drive tool: append_drive_file(file_id={file_id!r})")
     try:
-        if FOLDER_ID not in _parents(file_id):
+        service, meta = _mutation_identity(file_id)
+        if not _inside_working_tree(service, meta.get("parents")):
             return _refuse_write(
                 "הקובץ הזה לא נמצא בתיקיית העבודה, ולכן אני יכול רק לקרוא אותו ולא לשנות אותו."
             )
-        service = _drive_service()
-        meta = service.files().get(
-            fileId=file_id,
-            fields="mimeType, name, permissions(emailAddress,role,type,domain,displayName)",
-            supportsAllDrives=True,
-        ).execute()
         refusal = _check_shared_edit(file_id, service, confirmed_shared_edit, meta)
         if refusal:
             return _refuse_write(refusal)
@@ -956,6 +1014,117 @@ def append_drive_file(file_id: str, content: str,
     except Exception as e:
         logger.error(f"append_drive_file failed for {file_id!r}: {e}")
         return f"❌ הוספה לקובץ נכשלה: {e}"
+
+
+def rename_drive_file(file_id: str, new_name: str,
+                      confirmed_shared_edit: bool = False) -> str:
+    """Renames a file or folder inside the working folder tree.
+
+    Part of the unlimited freedom the assistant has inside its working
+    folder: rename needs no approval there. Outside the tree a file is
+    read-only, and the call says so.
+
+    A file that anyone besides Itai and the bot can see is never renamed
+    without his explicit approval in the conversation (then
+    confirmed_shared_edit=True) - the shared-file rule covers every change,
+    not only edits.
+
+    Args:
+        file_id: The file's Drive id.
+        new_name: The new name.
+        confirmed_shared_edit: True only after Itai explicitly approved
+            changing this specific shared file in this conversation.
+
+    Returns:
+        Confirmation with old and new names, or the reason it was refused.
+    """
+    file_id = (file_id or "").strip()
+    new_name = (new_name or "").strip()
+    if not file_id:
+        return _refuse_write("צריך מזהה קובץ.")
+    if not new_name:
+        return _refuse_write("צריך שם חדש.")
+
+    logger.info(f"Drive tool: rename_drive_file(file_id={file_id!r}, new_name={new_name!r})")
+    try:
+        service, meta = _mutation_identity(file_id)
+        old_name = meta.get("name", "(ללא שם)")
+        if not _inside_working_tree(service, meta.get("parents")):
+            return _refuse_write(
+                f"{old_name!r} לא נמצא בתיקיית העבודה, ומחוץ לה אין לי הרשאות כתיבה."
+            )
+        refusal = _check_shared_edit(file_id, service, confirmed_shared_edit, meta)
+        if refusal:
+            return _refuse_write(refusal)
+        service.files().update(
+            fileId=file_id, body={"name": new_name}, fields="id, name",
+            supportsAllDrives=True,
+        ).execute()
+        return f"✅ השם שונה: {old_name!r} ← {new_name!r}"
+    except Exception as e:
+        logger.error(f"rename_drive_file failed for {file_id!r}: {e}")
+        return f"❌ שינוי השם נכשל: {e}"
+
+
+def move_drive_file(file_id: str, destination_folder_id: str = "",
+                    confirmed_shared_edit: bool = False) -> str:
+    """Moves a file or folder to another place inside the working folder tree.
+
+    Both ends must be inside the tree: the thing being moved and the folder
+    it moves into. With no destination the working folder itself is the
+    target. Moving within the tree needs no approval - it is part of the
+    unlimited freedom Itai granted there (2026-09-08).
+
+    A file that anyone besides Itai and the bot can see is never moved
+    without his explicit approval in the conversation (then
+    confirmed_shared_edit=True): moving changes where other people find it,
+    so the shared-file rule covers it exactly like an edit.
+
+    Args:
+        file_id: The file's Drive id.
+        destination_folder_id: A folder INSIDE the working folder tree.
+            Empty means the working folder itself.
+        confirmed_shared_edit: True only after Itai explicitly approved
+            moving this specific shared file in this conversation.
+
+    Returns:
+        Confirmation naming the file and where it went, or the refusal.
+    """
+    file_id = (file_id or "").strip()
+    if not file_id:
+        return _refuse_write("צריך מזהה קובץ.")
+    if not FOLDER_ID:
+        return _refuse_write("לא הוגדרה תיקיית עבודה בדרייב (DRIVE_FOLDER_ID), אז אין לאן להעביר.")
+    destination = _working_parent(destination_folder_id)
+    if not destination:
+        return _refuse_write("תיקיית היעד לא נמצאת בתוך תיקיית העבודה, אז אי אפשר להעביר אליה.")
+
+    logger.info(f"Drive tool: move_drive_file(file_id={file_id!r}, to={destination_folder_id!r})")
+    try:
+        service, meta = _mutation_identity(file_id)
+        name = meta.get("name", "(ללא שם)")
+        current_parents = meta.get("parents") or []
+        if not _inside_working_tree(service, current_parents):
+            return _refuse_write(
+                f"{name!r} לא נמצא בתיקיית העבודה, ומחוץ לה אין לי הרשאות כתיבה. "
+                "אם צריך, אפשר לשמור עותק בתיקיית העבודה עם save_to_drive_folder."
+            )
+        if destination in current_parents and len(current_parents) == 1:
+            return f"ℹ️ {name!r} כבר נמצא בתיקיית היעד."
+        refusal = _check_shared_edit(file_id, service, confirmed_shared_edit, meta)
+        if refusal:
+            return _refuse_write(refusal)
+        service.files().update(
+            fileId=file_id,
+            addParents=destination,
+            removeParents=",".join(current_parents),
+            fields="id, name, parents",
+            supportsAllDrives=True,
+        ).execute()
+        return f"✅ {name!r} הועבר לתיקייה המבוקשת בתוך תיקיית העבודה."
+    except Exception as e:
+        logger.error(f"move_drive_file failed for {file_id!r}: {e}")
+        return f"❌ ההעברה נכשלה: {e}"
 
 
 def save_to_drive_folder(file_id: str) -> str:
@@ -1036,9 +1205,10 @@ def trash_drive_file(file_id: str, permanent: bool = False,
     has said in this conversation that he wants it gone for good - that one has
     no undo, so confirm it with him in words before calling it that way.
 
-    Unlike editing, this is not restricted to the working folder: it can bin
-    anything Itai owns anywhere in his Drive. A file somebody else owns cannot
-    be binned by him at all, and Google's refusal is reported as it comes.
+    Like every write, this is restricted to the working folder tree: inside
+    it the assistant's permissions are unlimited (Itai's rule, 2026-09-08),
+    and outside it a file is read-only. A file somebody else owns cannot be
+    binned at all, and Google's refusal is reported as it comes.
 
     A file that anyone besides Itai and the bot can see is never binned or
     deleted without his explicit approval in the conversation - the refusal
@@ -1060,15 +1230,15 @@ def trash_drive_file(file_id: str, permanent: bool = False,
 
     logger.info(f"Drive tool: trash_drive_file(file_id={file_id!r}, permanent={permanent})")
     try:
-        service = _drive_service()
         # Read the name before acting: the confirmation has to say what actually
         # went, and after a permanent delete there is nothing left to ask.
-        meta = service.files().get(
-            fileId=file_id,
-            fields="name, ownedByMe, trashed, permissions(emailAddress,role,type,domain,displayName)",
-            supportsAllDrives=True,
-        ).execute()
+        service, meta = _mutation_identity(file_id)
         name = meta.get("name", "(ללא שם)")
+        if not _inside_working_tree(service, meta.get("parents")):
+            return _refuse_write(
+                f"{name!r} לא נמצא בתיקיית העבודה, ומחוץ לה אין לי הרשאות כתיבה - "
+                "אני יכול רק לקרוא אותו. אם צריך, אפשר לשמור עותק בתיקיית העבודה ולטפל בו שם."
+            )
         if meta.get("trashed") and not permanent:
             return f"ℹ️ הקובץ {name!r} כבר נמצא בפח של הדרייב."
         refusal = _check_shared_edit(file_id, service, confirmed_shared_edit, meta)

@@ -83,29 +83,62 @@ def test_an_empty_watchlist_fetches_nothing():
 
 # --- the message --------------------------------------------------------------
 
-def test_the_model_path_hands_the_model_the_day_and_returns_its_text():
+def _patched_data(ask, football=None, fixtures=None, stocks=None, history=""):
+    """The standard fixture set: every data source patched, so a test names
+    only the one it cares about."""
+    return (
+        patch.object(es.llm, "ask", side_effect=ask) if ask else
+        patch.object(es.llm, "ask", return_value=None),
+        patch.object(es, "fetch_football", return_value=football or []),
+        patch.object(es, "fetch_fixtures", return_value=fixtures or []),
+        patch.object(es, "stocks_section", return_value=stocks or []),
+        patch.object(es, "_todays_conversation", return_value=history),
+    )
+
+
+def test_the_model_writes_only_the_two_judgement_sections():
+    """After the 2026-09-08 hallucination the model is never handed the feeds:
+    it writes the recap and the questions from the conversation, and the
+    data sections are composed in code around its text."""
     captured = {}
 
     def fake_ask(prompt, system="", max_tokens=600, temperature=0.2, skip=()):
         captured["prompt"] = prompt
-        return "🌙 סיכום מהמודל"
+        return "[סיכום]\n- היה ביבנה\n[שאלות]\n- עשית VOC?"
 
-    with patch.object(es.llm, "ask", side_effect=fake_ask), \
-         patch.object(es, "fetch_football", return_value=["מכבי 1-0"]), \
-         patch.object(es, "fetch_stocks", return_value=["NVDA.US: 175.1"]), \
-         patch.object(es, "_todays_conversation", return_value="איתי: הייתי ביבנה"):
+    patches = _patched_data(fake_ask, football=["מכבי 1-0"],
+                            fixtures=["יום רביעי 21:00: X נגד Y"],
+                            stocks=["NVDA.US: 175.1"], history="איתי: הייתי ביבנה")
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
         text = es.build_message(at("20:00"), "972500000000")
-    assert text == "🌙 סיכום מהמודל"
-    assert "מכבי 1-0" in captured["prompt"]
-    assert "NVDA.US" in captured["prompt"]
+    assert "היה ביבנה" in text and "עשית VOC" in text
+    assert "מכבי 1-0" in text and "NVDA.US: 175.1" in text
+    assert "יום רביעי 21:00" in text
     assert "הייתי ביבנה" in captured["prompt"]
+    assert "מכבי 1-0" not in captured["prompt"]  # the model never sees the feed
+    assert "NVDA.US" not in captured["prompt"]
+
+
+def test_the_model_cannot_add_a_match_the_feed_did_not_return():
+    """Regression for the first summary, which announced a 2026 World Cup
+    final from the model's own memory: the football and fixture sections are
+    built from the feed alone, so a hallucinating model cannot put a game in
+    them even when it tries."""
+    def hallucinating_ask(prompt, **kwargs):
+        return "[סיכום]\n- גמר מונדיאל 2026 היום ב-22:00!\n[שאלות]\n- צפית?"
+
+    patches = _patched_data(hallucinating_ask)
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        text = es.build_message(at("20:00"), "972500000000")
+    football = text.split("⚽ *כדורגל*")[1].split("🗓️")[0]
+    fixtures = text.split("🗓️ *משחקים קרובים*")[1].split("📈")[0]
+    assert "אין תוצאות" in football and "מונדיאל" not in football
+    assert "אין משחקים קרובים" in fixtures and "מונדיאל" not in fixtures
 
 
 def test_without_a_model_the_message_still_goes_out_with_real_data():
-    with patch.object(es.llm, "ask", return_value=None), \
-         patch.object(es, "fetch_football", return_value=["מכבי 1-0"]), \
-         patch.object(es, "fetch_stocks", return_value=[]), \
-         patch.object(es, "_todays_conversation", return_value=""):
+    patches = _patched_data(None, football=["מכבי 1-0"])
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
         text = es.build_message(at("20:00"), "972500000000")
     assert "🌙" in text and "⚽" in text and "📈" in text and "❓" in text
     assert "מכבי 1-0" in text
@@ -115,19 +148,16 @@ def test_without_a_model_the_message_still_goes_out_with_real_data():
 def test_the_fallback_asks_for_holdings_instead_of_inventing_prices():
     """Excellence has no retail API and no watchlist is configured: the honest
     section is a question, not a made-up number."""
-    with patch.object(es.llm, "ask", return_value=None), \
-         patch.object(es, "fetch_football", return_value=[]), \
-         patch.object(es, "fetch_stocks", return_value=[]), \
-         patch.object(es, "_todays_conversation", return_value=""):
+    patches = _patched_data(None)
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
         text = es.build_message(at("20:00"), "972500000000")
     assert "לא הוגדרו מניות" in text
 
 
 def test_a_broken_model_call_falls_back_instead_of_raising():
+    patches = _patched_data(None)
     with patch.object(es.llm, "ask", side_effect=RuntimeError("boom")), \
-         patch.object(es, "fetch_football", return_value=[]), \
-         patch.object(es, "fetch_stocks", return_value=[]), \
-         patch.object(es, "_todays_conversation", return_value=""):
+         patches[1], patches[2], patches[3], patches[4]:
         text = es.build_message(at("20:00"), "972500000000")
     assert "🌙" in text
 
@@ -203,3 +233,49 @@ def test_a_build_that_blows_up_gives_the_day_back(monkeypatch):
 
 def test_the_routine_is_registered_with_the_heartbeat():
     assert proactive.evening_summary in proactive.ROUTINES
+
+
+# --- fixtures ----------------------------------------------------------------
+
+def test_fixtures_come_from_the_feed_israel_first():
+    payload = {"events": [
+        {"strLeague": "Spanish La Liga", "strHomeTeam": "Real Madrid",
+         "strAwayTeam": "Barcelona", "intHomeScore": None, "intAwayScore": None,
+         "strTimestamp": "2026-09-09T18:00:00"},
+        {"strLeague": "Israeli Premier League", "strHomeTeam": "מכבי תל אביב",
+         "strAwayTeam": "הפועל חיפה", "intHomeScore": None, "intAwayScore": None,
+         "strTimestamp": "2026-09-09T17:00:00"},
+        {"strLeague": "English Premier League", "strHomeTeam": "Arsenal",
+         "strAwayTeam": "Chelsea", "intHomeScore": "2", "intAwayScore": "1"},
+    ]}
+    with patch.object(es.requests, "get", return_value=_json_response(payload)):
+        lines = es.fetch_fixtures("2026-09-08", days_ahead=1)
+    assert len(lines) == 2  # the finished match is not a fixture
+    assert lines[0].startswith("יום רביעי 09/09 20:00: מכבי תל אביב נגד")
+    assert "Real Madrid נגד Barcelona" in lines[1]
+
+
+def test_fixtures_failure_returns_empty_instead_of_raising():
+    with patch.object(es.requests, "get", side_effect=RuntimeError("down")):
+        assert es.fetch_fixtures("2026-09-08") == []
+
+
+# --- the portfolio in the stocks section -------------------------------------
+
+def test_a_stored_portfolio_replaces_the_watchlist():
+    import portfolio
+    holdings = [{"name": "NVIDIA", "symbol": "NVDA", "quantity": 10, "cost": 150.0}]
+    with patch.object(portfolio, "load_holdings", return_value=holdings), \
+         patch.object(es, "_stooq_quotes",
+                      return_value={"NVDA.US": {"close": 175.0, "open": 170.0}}):
+        lines = es.stocks_section()
+    assert lines[0].startswith("NVIDIA (NVDA.US): 175")
+    assert "+16.7% מהעלות" in lines[0]
+
+
+def test_without_a_portfolio_the_watchlist_is_the_fallback():
+    import portfolio
+    with patch.object(portfolio, "load_holdings", return_value=[]), \
+         patch.object(es, "fetch_stocks", return_value=["NVDA.US: 175.1"]) as watch:
+        assert es.stocks_section() == ["NVDA.US: 175.1"]
+    watch.assert_called_once()

@@ -49,6 +49,7 @@ around. Rule 1 had that conversation, and the answer was yes.
 import io
 import logging
 import os
+import re
 
 import attachment_readers
 import google_scopes
@@ -76,9 +77,13 @@ MAX_RESULTS = 15
 MAX_LISTING_CHARS = 4000
 
 # Google's own formats have no bytes to download - they are exported instead.
+# A spreadsheet is exported as xlsx, not csv: Drive's csv export carries only
+# the FIRST tab, so a workbook with several sheets silently lost every tab but
+# one. xlsx keeps them all, and attachment_readers walks every sheet.
 GOOGLE_EXPORTS = {
     "application/vnd.google-apps.document": ("text/plain", "txt"),
-    "application/vnd.google-apps.spreadsheet": ("text/csv", "csv"),
+    "application/vnd.google-apps.spreadsheet": (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"),
     "application/vnd.google-apps.presentation": ("text/plain", "txt"),
 }
 
@@ -147,6 +152,9 @@ def _list(query: str, label: str) -> str:
         pageSize=MAX_RESULTS,
         orderBy="modifiedTime desc",
         fields="files(id, name, mimeType, modifiedTime, owners(displayName, emailAddress), shared, ownedByMe)",
+        # Without corpora="allDrives" the list only covers his own Drive and
+        # direct shares; a file that lives in a shared drive is invisible to it.
+        corpora="allDrives",
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
     ).execute()
@@ -159,6 +167,23 @@ def _list(query: str, label: str) -> str:
         out = out[:MAX_LISTING_CHARS].rsplit("\n", 1)[0] + "\n[הרשימה קוצרה]"
     return out
 
+
+
+def _extract_file_id(value: str) -> str:
+    """Accepts a bare file id or a whole Google Drive/Docs/Sheets link.
+
+    Share notifications arrive as email with a link, and the link's path or
+    query carries the id (…/d/<id>/…, /folders/<id>, ?id=<id>). Opening that
+    link in a browser hits a login wall; the id inside it is what works.
+    """
+    value = (value or "").strip()
+    match = re.search(r"/(?:d|folders)/([A-Za-z0-9_-]{10,})", value)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", value)
+    if match:
+        return match.group(1)
+    return value
 
 def _parents(file_id: str) -> list:
     meta = _drive_service().files().get(
@@ -235,14 +260,18 @@ def read_drive_file(file_id: str, part: int = 1) -> str:
     Itai asked about is not in part 1, call this again with part=2 rather than
     answering from the first page alone.
 
+    A full Google Drive/Docs/Sheets LINK works too - share notifications arrive
+    as email with a link, and the id inside it is extracted here. Never open
+    such a link with read_web_page: the browser hits a login wall, this does not.
+
     Args:
-        file_id: The file's Drive id, as it appeared in square brackets.
+        file_id: The file's Drive id, as it appeared in square brackets, or its link.
         part: Which page of a long file to read. Starts at 1.
 
     Returns:
         The file's text, or an explanation of why it could not be read.
     """
-    file_id = (file_id or "").strip()
+    file_id = _extract_file_id(file_id)
     if not file_id:
         return "צריך מזהה קובץ."
     logger.info(f"Drive tool: read_drive_file(file_id={file_id!r}, part={part})")

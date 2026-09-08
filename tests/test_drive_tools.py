@@ -226,16 +226,45 @@ def test_a_google_doc_is_exported_because_it_has_no_bytes_to_download():
     assert out == "סיכום הפגישה"
 
 
-def test_a_spreadsheet_is_exported_as_csv_so_the_row_reader_can_take_it():
+def test_a_spreadsheet_is_exported_as_xlsx_so_every_tab_survives():
+    """Drive's csv export carries only the FIRST tab of a spreadsheet - a
+    workbook with several sheets lost all but one. xlsx keeps every tab, and
+    attachment_readers walks every sheet in it."""
     files = _files(
         get={"id": "s1", "name": "Z8 Training Status", "mimeType": "application/vnd.google-apps.spreadsheet"},
-        export=b"a,b\n1,2\n",
+        export=b"PK\x03\x04",
     )
     with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
         with patch.object(drive_tools.attachment_readers, "extract_text", return_value="a,b") as extract:
             drive_tools.read_drive_file("s1")
-    assert files.export.call_args.kwargs["mimeType"] == "text/csv"
-    assert extract.call_args.args[0].endswith(".csv")
+    assert files.export.call_args.kwargs["mimeType"] == (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    assert extract.call_args.args[0].endswith(".xlsx")
+
+
+def test_a_share_link_from_an_email_is_read_by_the_id_inside_it():
+    """Share notifications arrive as mail carrying a docs.google.com link.
+    Opening that link in a browser hits a login wall; the id inside it is what
+    the API needs."""
+    real_id = "1AbCDefGhIJkLmNoPqRsTuVwXyZ0123456789"
+    files = _files(
+        get={"id": real_id, "name": "סיכום", "mimeType": "application/vnd.google-apps.document"},
+        export=b"tekst",
+    )
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        with patch.object(drive_tools.attachment_readers, "extract_text", return_value="x"):
+            drive_tools.read_drive_file(
+                f"https://docs.google.com/document/d/{real_id}/edit?usp=sharing")
+    assert files.get.call_args.kwargs["fileId"] == real_id
+
+
+def test_search_covers_shared_drives_and_not_only_his_own():
+    """The default corpora covers his My Drive and direct shares. A file living
+    in a shared drive is invisible until the search is widened to allDrives."""
+    files = _files(list={"files": []})
+    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+        drive_tools.search_drive("דוח")
+    assert files.list.call_args.kwargs["corpora"] == "allDrives"
 
 
 def test_an_uploaded_file_is_downloaded_rather_than_exported():

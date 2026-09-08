@@ -7,9 +7,11 @@ import requests
 from flask import Flask, Response, abort, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+import media_tools
 import proactive
 import storage
-from assistant import handle_whatsapp_message
+from assistant import (handle_document_message, handle_image_message,
+                         handle_voice_message, handle_whatsapp_message)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +31,15 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v21.0")
 # endpoint does not exist at all - an unguarded /tick is a stranger's
 # button for making the assistant message Itai.
 TICK_SECRET = os.environ.get("TICK_SECRET", "")
+
+# The one person this assistant serves, in international form without a plus
+# (9725...). When set, messages from any other number are dropped before they
+# reach the assistant - see _is_owner for why the check lives here and why a
+# stranger gets silence rather than a polite refusal. Unset, every sender is
+# accepted: that is the fallback the proactive side already relies on (it
+# writes to whoever messaged last), and a lock whose key was never cut would
+# lock Itai out of his own assistant.
+OWNER_PHONE = os.environ.get("OWNER_PHONE", "").strip()
 
 
 def _is_valid_meta_signature(req) -> bool:
@@ -115,26 +126,71 @@ def _send_whatsapp_reply(to: str, text: str) -> None:
     return bool(parts)
 
 
+def _normalise_number(value: str) -> str:
+    """Meta sends phone numbers as digits only; an env var pasted out of a
+    contacts app may carry a plus, spaces or dashes. Digits are the common
+    ground, so the comparison keeps only them."""
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def _is_owner(sender: str) -> bool:
+    """Whether this sender is the person the assistant exists for.
+
+    The Meta signature check proves the POST came from Meta. It says nothing
+    about who pressed send: anyone who messages the bot's business number
+    reaches this handler, and behind it sits an assistant that can read Itai's
+    mail, files, calendar and tasks. With OWNER_PHONE configured, every other
+    number is dropped here, before a single tool exists for them.
+
+    Dropped means silent, not a courteous "this bot is private". A reply
+    confirms to a stranger that the number is a live bot wired to someone's
+    accounts - exactly the reconnaissance the check is meant to deny - and a
+    wrong number already looks like silence, so silence costs nothing.
+
+    The check runs before note_inbound on purpose: the proactive side sends to
+    the most recent inbound number, so recording a stranger's message would
+    aim the next reminder at the stranger.
+    """
+    if not OWNER_PHONE:
+        return True
+    return _normalise_number(sender) == _normalise_number(OWNER_PHONE)
+
+
 def _extract_incoming_message(payload: dict):
-    """Returns (sender, text, message_type) for the first message in a Meta
-    webhook payload, or (None, None, None) for non-message events
+    """Returns (sender, text, message_type, media) for the first message in a
+    Meta webhook payload, or (None, None, None, None) for non-message events
     (delivery/read receipts, template status updates, etc.) which Meta also
     sends to this same webhook. message_type is Meta's own type string
     ('text', 'image', 'audio', 'location', ...) so the caller can tell a real
     but unsupported message (which deserves a reply) apart from no message
-    at all (which doesn't)."""
+    at all (which doesn't).
+
+    For media messages the payload carries no bytes - only a pointer. media is
+    then {'id', 'mime_type', 'caption'} taken from the message's image/audio
+    block; caption exists only on images, and is empty for a voice note."""
     try:
         value = payload["entry"][0]["changes"][0]["value"]
         messages = value.get("messages")
         if not messages:
-            return None, None, None
+            return None, None, None, None
         message = messages[0]
         sender = message.get("from")
         message_type = message.get("type", "unknown")
         text = message.get("text", {}).get("body", "") if message_type == "text" else ""
-        return sender, text, message_type
+        media = None
+        if message_type in ("image", "audio", "document"):
+            info = message.get(message_type) or {}
+            media = {
+                "id": info.get("id"),
+                "mime_type": info.get("mime_type", ""),
+                "caption": info.get("caption", ""),
+                # Only documents carry a filename, and for a document it is
+                # the dispatch signal - the extension decides how it is read.
+                "filename": info.get("filename", ""),
+            }
+        return sender, text, message_type, media
     except (KeyError, IndexError, TypeError):
-        return None, None, None
+        return None, None, None, None
 
 
 @app.route("/webhook", methods=["GET"])
@@ -155,22 +211,60 @@ def receive_webhook():
         abort(403)
 
     payload = request.get_json(silent=True) or {}
-    sender, text, message_type = _extract_incoming_message(payload)
+    sender, text, message_type, media = _extract_incoming_message(payload)
+
+    if sender and not _is_owner(sender):
+        logger.warning(f"Message from a non-owner number ({sender}) - ignored.")
+        return "OK", 200
 
     if sender:
         # Itai writing is what reopens WhatsApp's 24-hour window, and the
         # proactive side has no other way to know when that happened. Recorded
-        # for any message type - an unsupported voice note reopens it too.
+        # for any message type - even a video we cannot watch reopens it too.
         storage.note_inbound(sender)
 
     if sender and message_type == "text" and text:
         reply_text = handle_whatsapp_message(text.strip(), sender_id=sender)
         _send_whatsapp_reply(sender, reply_text)
+    elif sender and message_type == "image" and media and media.get("id"):
+        image_bytes, mime = media_tools.download_media(media["id"])
+        if image_bytes:
+            reply_text = handle_image_message(
+                image_bytes, mime or media["mime_type"],
+                media.get("caption", ""), sender_id=sender)
+        else:
+            reply_text = "קיבלתי ששלחת תמונה, אבל ההורדה שלה מוואטסאפ נכשלה. אפשר לשלוח אותה שוב?"
+        _send_whatsapp_reply(sender, reply_text)
+    elif sender and message_type == "audio" and media and media.get("id"):
+        audio_bytes, mime = media_tools.download_media(media["id"])
+        if audio_bytes:
+            reply_text = handle_voice_message(audio_bytes, mime or media["mime_type"], sender_id=sender)
+        else:
+            reply_text = "קיבלתי ששלחת הודעה קולית, אבל ההורדה שלה מוואטסאפ נכשלה. אפשר לשלוח אותה שוב?"
+        _send_whatsapp_reply(sender, reply_text)
+    elif sender and message_type == "document" and media and media.get("id"):
+        data, mime = media_tools.download_media(media["id"])
+        if not data:
+            reply_text = "קיבלתי ששלחת קובץ, אבל ההורדה שלו מוואטסאפ נכשלה. אפשר לשלוח אותו שוב?"
+        else:
+            base = media_tools.base_mime(mime or media["mime_type"])
+            caption = media.get("caption", "")
+            # People send photos as documents to keep the original quality, and
+            # voice messages occasionally arrive as files - dispatch on what the
+            # bytes are, not on which button he pressed.
+            if base.startswith("image/"):
+                reply_text = handle_image_message(data, base, caption, sender_id=sender)
+            elif base.startswith("audio/"):
+                reply_text = handle_voice_message(data, base, sender_id=sender)
+            else:
+                reply_text = handle_document_message(
+                    data, media.get("filename", ""), base, caption, sender_id=sender)
+        _send_whatsapp_reply(sender, reply_text)
     elif sender and message_type is not None:
-        # A real message of a type we don't handle (voice note, image, location...) -
+        # A real message of a type we don't handle (video, location...) -
         # reply so the person knows the bot saw it, instead of silence that looks broken.
         logger.info(f"Unsupported message type '{message_type}' from {sender} — replying with guidance.")
-        _send_whatsapp_reply(sender, "כרגע אני תומך רק בהודעות טקסט. אפשר לתאר את זה במילים? 🙂")
+        _send_whatsapp_reply(sender, "כרגע אני מבין טקסט, תמונות, מסמכים והודעות קוליות. את זה אפשר לתאר במילים? 🙂")
     else:
         logger.info("Webhook event with no incoming message (status update, etc.) — ignored.")
 

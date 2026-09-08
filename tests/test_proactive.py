@@ -976,3 +976,26 @@ def test_curiosity_falling_over_gives_the_day_back_and_spares_the_tick(ledger, m
     assert summary["due"] == 0
     # The day is not spent on a run that never asked anything.
     assert fake.claimed == set()
+
+
+def test_the_drive_mirror_routine_is_registered_and_sends_nothing():
+    """The folder mirror is bookkeeping, not a message: it runs inside the
+    heartbeat so the working folder tracks shares even when nobody asks, and
+    it must never produce a WhatsApp message of its own."""
+    from unittest.mock import patch
+    import drive_tools
+
+    assert proactive.shared_files_mirror in proactive.ROUTINES
+    with patch.object(
+        drive_tools, "mirror_bot_shares",
+        return_value={"added": ["x"], "already": 0, "failed": []},
+    ) as mirror:
+        assert proactive.shared_files_mirror(datetime.now(ISRAEL_TZ)) == []
+    mirror.assert_called_once()
+
+
+def test_the_drive_mirror_routine_stays_quiet_without_a_bot_identity(monkeypatch):
+    """A service with no service-account key must tick past the mirror as if
+    it were not there."""
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+    assert proactive.shared_files_mirror(datetime.now(ISRAEL_TZ)) == []

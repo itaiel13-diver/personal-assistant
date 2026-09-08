@@ -16,10 +16,14 @@ the review shows it - dated to the report, never as a live number.
 
 Pricing is honest about its limits. stooq's free feed knows US and global
 tickers, so a holding whose symbol looks like one (letters, short) is
-priced as SYMBOL.US. An Israeli security number (נייר ערך מספר ...) has no
-free feed the bot can reach - it is listed with its quantity and cost and
-marked as having no live quote. A missing price is reported, never
-invented, and percentages never mix currencies into a made-up total.
+priced as SYMBOL.US. An Israeli security number (נייר ערך מספר ...) is
+priced from the Tel Aviv Stock Exchange's own feeds (tase.py): the export's
+נייר number addresses them directly, exchange-traded securities come back
+as end-of-day rows and mutual funds as the once-a-day published price - in
+shekels, dated, and never real-time. A number the feeds do not answer is
+listed with its quantity and cost and marked as having no current price. A
+missing price is reported, never invented, and percentages never mix
+currencies into a made-up total.
 
 Bitcoin never appears in that export at all, so it arrives by chat instead:
 "יש לי 0.35 ביטקוין" is parsed in code (never by the model - a misheard
@@ -194,19 +198,35 @@ def stooq_symbol(holding: dict) -> str | None:
     return None
 
 
-def review_lines(holdings: list, closes: dict, crypto_quotes: dict | None = None) -> list:
+def tase_security_id(holding: dict) -> str | None:
+    """The TASE security number for an Israeli holding, when it has one.
+
+    The Excellence export lists Israeli securities by their נייר number -
+    digits only - and those same numbers address the exchange's feeds, so
+    no symbol mapping is ever needed. Crypto and lettered tickers return
+    None: their own feeds handle them."""
+    if holding.get("kind") == "crypto":
+        return None
+    raw = (holding.get("symbol") or "").strip()
+    return raw if raw.isdigit() else None
+
+
+def review_lines(holdings: list, closes: dict, crypto_quotes: dict | None = None,
+                 tase_quotes: dict | None = None) -> list:
     """The daily review as display lines: per holding, the day's move and the
     move since cost; then the count of risers and fallers.
 
     closes maps a stooq symbol to {"close": float|None, "open": float|None};
     crypto_quotes maps a CoinGecko id to {"price": float|None, "change_24h":
-    float|None}, in USD. Pure and total in what it shows: every number comes
+    float|None}, in USD; tase_quotes maps a נייר number to tase.py's quote
+    dict (shekels, end-of-day, dated). Pure and total in what it shows: every number comes
     from the export or from the feeds it was handed, a holding without a live
     quote says so, and a coin whose cost was never given says "עלות לא ידועה"
     instead of inventing a gain. Dollars stay inside the coin's own line -
     they are never folded into a shekel total.
     """
     crypto_quotes = crypto_quotes or {}
+    tase_quotes = tase_quotes or {}
     lines = []
     up_today = down_today = 0
     gainers = losers = 0
@@ -247,6 +267,27 @@ def review_lines(holdings: list, closes: dict, crypto_quotes: dict | None = None
         open_ = (quote or {}).get("open")
         cost = h.get("cost")
         quantity = h.get("quantity")
+        tase_id = tase_security_id(h)
+        tase_quote = tase_quotes.get(tase_id) if tase_id else None
+        if tase_id and tase_quote and tase_quote.get("close") is not None:
+            # Priced from the exchange's own feed, in shekels. The line says
+            # the trading day's date because a fund's price can lag a day,
+            # and never computes a move since cost: the export does not say
+            # whether its cost is in shekels or agorot, so the comparison
+            # could be wrong by a hundredfold.
+            tase_close = tase_quote["close"]
+            tase_change = tase_quote.get("change_pct")
+            parts = [f"₪{tase_close:,.2f}"]
+            if tase_change is not None:
+                parts.append(f"{tase_change:+.1f}% ביום המסחר")
+                up_today += tase_change > 0
+                down_today += tase_change < 0
+            if quantity is not None:
+                parts.append(f"שווי ≈ ₪{tase_close * quantity:,.0f}")
+            if tase_quote.get("date"):
+                parts.append(f"שער {tase_quote['date']}")
+            lines.append(f"{name} ({tase_id}): {', '.join(parts)}")
+            continue
         if close is None:
             detail = []
             if quantity is not None:
@@ -301,8 +342,8 @@ def import_export(filename: str, data: bytes) -> str | None:
     message = (
         f"✅ התיק נשמר - {len(holdings)} החזקות: {names}{more}.\n"
         "מכאן אני בודק אותו בעצמי כל ערב בסיכום: מושך מחירים עדכניים ומחשב "
-        "מה עלה ומה ירד, בלי שתצטרך לשלוח שוב. ניירות ישראליים בלי סמל "
-        "גלובלי יופיעו בלי מחיר חי - אין להם מקור חינמי שאני יכול להגיע אליו."
+        "מה עלה ומה ירד, בלי שתצטרך לשלוח שוב. גם ניירות ישראליים מתומחרים "
+        "כל ערב מהבורסה לפי מספר הנייר - שער סוף יום, לא מחיר בזמן אמת."
     )
     if kept:
         message += (f"\n{len(kept)} החזקות הקריפטו שנרשמו בצ'אט נשמרו "

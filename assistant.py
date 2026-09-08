@@ -38,6 +38,7 @@ from drive_tools import (
     trash_drive_file,
     update_drive_file,
 )
+from media_tools import base_mime
 from todo_tools import (
     add_todo_checklist_item,
     complete_todo_task,
@@ -258,6 +259,11 @@ reports that Microsoft rejected the request, say so plainly - do not tell him a
 task was saved when the tool did not say it was.
 If the tools report the connection is not set up, tell him it needs one browser
 approval and offer to walk him through it; do not keep retrying.
+
+PICTURES AND VOICE MESSAGES:
+- Itai can now send photos: a display in a store, a price tag, a screen, a shelf. Look at the actual image before answering and answer from what is in it - never describe what you assume a photo shows.
+- Voice messages reach you already transcribed, marked [הודעה קולית מאיתי - תמלול]. Treat the transcript as his own words and answer it directly. A transcript can mishear names and numbers, so read it charitably - and if a number or name matters (a sum, a date, a branch), repeat it back before acting on it.
+- A photo is visible only in the turn it arrived in. Later turns carry only a marker that a photo was sent, not the photo itself - so if he asks about a photo from an earlier turn, say you can no longer see it and ask him to send it again. Never invent its contents from the marker.
 
 COMMUNICATION STYLE:
 - Natural, sharp, highly structured Israeli business Hebrew.
@@ -594,6 +600,119 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
     # WhatsApp API as a null body and fail silently, leaving the sender with
     # no reply and no clue why.
     return response.text or "לא הצלחתי לייצר תשובה להודעה הזו. אפשר לנסח את זה קצת אחרת?"
+
+# 6. תמונות והודעות קוליות
+# היסטוריית השיחה נשמרת ב-Postgres כ-JSON. תמונה שנשלחה inline הייתה נשמרת
+# שם כ-base64 של מגה-בייטים בכל הודעה - וכל הודעה הבאה הייתה מעלה את כולן
+# בחזרה למודל. לכן לפני השמירה כל part של inline_data מוחלף בסמן טקסט,
+# והמחיר הידוע של זה מתועד בפרומפט: תמונה נראית רק בתורה שהגיעה בו.
+_MEDIA_PLACEHOLDERS = {
+    "image": "[איתי שלח תמונה - התמונה עצמה נראתה באותה הודעה ואינה שמורה]",
+    "audio": "[איתי שלח הודעה קולית]",
+    "video": "[איתי שלח סרטון]",
+    "default": "[איתי שלח קובץ מדיה]",
+}
+
+
+def _strip_inline_media(serialised_history: list) -> list:
+    """Replaces inline media parts with a text marker before the history is
+    stored. The marker - not the bytes - is what later turns will see."""
+    cleaned = []
+    for entry in serialised_history:
+        parts = entry.get("parts") if isinstance(entry, dict) else None
+        if not parts:
+            cleaned.append(entry)
+            continue
+        new_parts = []
+        for part in parts:
+            inline = part.get("inline_data") if isinstance(part, dict) else None
+            if inline:
+                kind = (inline.get("mime_type") or "").split("/")[0]
+                marker = _MEDIA_PLACEHOLDERS.get(kind, _MEDIA_PLACEHOLDERS["default"])
+                new_parts.append({"text": marker})
+            else:
+                new_parts.append(part)
+        cleaned.append({**entry, "parts": new_parts})
+    return cleaned
+
+
+def _transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
+    """Turns a voice note into text, in a call of its own.
+
+    This is the same separation web_tools uses for the opposite reason: here
+    nothing forbids mixing the audio into the main conversation, but the
+    transcript is what should live in the stored history - the audio itself
+    is megabytes that every later message would carry back to the model.
+    A separate call also means a failed transcription says "I could not hear
+    it" instead of silently becoming an answer to audio the model never got.
+    """
+    try:
+        response = _retry_on_server_error(lambda: client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
+                types.Part.from_bytes(data=audio_bytes, mime_type=base_mime(mime_type) or "audio/ogg"),
+                "זו הודעה קולית שאיתי שלח. תמלל אותה מילה במילה, בשפה שבה היא "
+                "הוקלטה (כמעט תמיד עברית), בלי להוסיף פרשנות ובלי לענות על "
+                "התוכן. אם חלק לא ברור, דלג עליו - אל תנחש מילים שלא שמעת.",
+            ],
+        ))
+        transcript = (response.text or "").strip()
+        return transcript or None
+    except Exception as e:
+        logger.error(f"Voice transcription failed: {e}")
+        return None
+
+
+def handle_voice_message(audio_bytes: bytes, mime_type: str, sender_id: str = "default") -> str:
+    """Answers a voice note by transcribing it, then letting the normal text
+    path answer the transcript.
+
+    The transcript enters the conversation marked as a voice note, so the
+    stored history stays all-text and the reply path - quota fallback,
+    history saving, error wording - is exactly the one a typed message gets.
+    """
+    transcript = _transcribe_audio(audio_bytes, mime_type)
+    if not transcript:
+        return "קיבלתי את ההודעה הקולית, אבל לא הצלחתי לשמוע אותה טוב. אפשר לשלוח שוב, או לכתוב במילים?"
+    logger.info(f"Voice note transcribed for {sender_id} ({len(transcript)} chars)")
+    return handle_whatsapp_message(f"[הודעה קולית מאיתי - תמלול]: {transcript}", sender_id=sender_id)
+
+
+def handle_image_message(image_bytes: bytes, mime_type: str, caption: str = "",
+                         sender_id: str = "default") -> str:
+    """Answers a photo. The image goes into the conversation inline - seeing
+    the actual pixels is the entire point - and is swapped for a text marker
+    before the history is stored, so Postgres never carries the bytes.
+
+    The fallback tiers in llm.py are text-only, so a photo that arrives after
+    Gemini's daily quota ran out gets an honest answer rather than a blind
+    description.
+    """
+    try:
+        # Same per-message budget reset a typed message gets - the model may
+        # answer a photo with a tool call, and the cap is per message either way.
+        begin_web_budget()
+        chat = _get_session(sender_id)
+        image_part = types.Part.from_bytes(
+            data=image_bytes, mime_type=base_mime(mime_type) or "image/jpeg")
+        caption = (caption or "").strip()
+        text_part = types.Part.from_text(text=caption if caption else (
+            "איתי שלח תמונה בלי כיתוב. תסתכל עליה ותספר בקצרה מה אתה רואה, "
+            "ואם יש בה משהו שדורש תשומת לב - תגיד."))
+        response = _send_with_retry(chat, [image_part, text_part])
+        if storage.enabled():
+            storage.save_history(sender_id, _strip_inline_media(_serialise(chat.get_history())))
+    except genai_errors.ClientError as e:
+        logger.error(f"Gemini client error on image for sender {sender_id}: {e}")
+        if getattr(e, "code", None) == 429:
+            return ("קיבלתי את התמונה, אבל נגמרה מכסת ה-AI היומית והמודל החלופי "
+                    "לא יודע לקרוא תמונות. אפשר לשלוח אותה שוב מחר, או לתאר במילים.")
+        return "מצטער, יש תקלה בחיבור ל-AI ולא הצלחתי לראות את התמונה. נסה/י שוב בעוד רגע."
+    except Exception as e:
+        logger.error(f"Gemini image call failed for sender {sender_id}: {e}")
+        return "מצטער, יש כרגע תקלה זמנית ולא הצלחתי לראות את התמונה. נסה/י שוב בעוד רגע."
+    return response.text or "לא הצלחתי לייצר תשובה לתמונה הזו. אפשר לנסח את זה קצת אחרת?"
+
 
 if __name__ == "__main__":
     print("🤖 העוזר האישי מוכן לפעולה!")

@@ -164,10 +164,19 @@ def test_valid_text_message_triggers_reply(client):
     mock_send.assert_called_once_with("972500000000", "תשובת בדיקה")
 
 
+def _video_message_payload(sender: str) -> dict:
+    """A video: a real message type the bot still does not handle."""
+    payload = _image_message_payload(sender)
+    message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+    message["video"] = message.pop("image")
+    message["type"] = "video"
+    return payload
+
+
 def test_unsupported_message_type_gets_graceful_reply_not_silence(client):
-    """An image/voice-note/location message must not be a black hole -
-    Gemini isn't called (nothing to feed it), but the sender gets a reply."""
-    body = json.dumps(_image_message_payload("972500000000")).encode()
+    """A video/document/location message must not be a black hole -
+    nothing is fed to the model, but the sender gets a reply."""
+    body = json.dumps(_video_message_payload("972500000000")).encode()
     with patch("webhook_server.handle_whatsapp_message") as mock_handle, \
          patch("webhook_server._send_whatsapp_reply") as mock_send:
         r = client.post(

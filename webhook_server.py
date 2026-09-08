@@ -7,9 +7,11 @@ import requests
 from flask import Flask, Response, abort, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+import media_tools
 import proactive
 import storage
-from assistant import handle_whatsapp_message
+from assistant import (handle_image_message, handle_voice_message,
+                         handle_whatsapp_message)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -116,25 +118,37 @@ def _send_whatsapp_reply(to: str, text: str) -> None:
 
 
 def _extract_incoming_message(payload: dict):
-    """Returns (sender, text, message_type) for the first message in a Meta
-    webhook payload, or (None, None, None) for non-message events
+    """Returns (sender, text, message_type, media) for the first message in a
+    Meta webhook payload, or (None, None, None, None) for non-message events
     (delivery/read receipts, template status updates, etc.) which Meta also
     sends to this same webhook. message_type is Meta's own type string
     ('text', 'image', 'audio', 'location', ...) so the caller can tell a real
     but unsupported message (which deserves a reply) apart from no message
-    at all (which doesn't)."""
+    at all (which doesn't).
+
+    For media messages the payload carries no bytes - only a pointer. media is
+    then {'id', 'mime_type', 'caption'} taken from the message's image/audio
+    block; caption exists only on images, and is empty for a voice note."""
     try:
         value = payload["entry"][0]["changes"][0]["value"]
         messages = value.get("messages")
         if not messages:
-            return None, None, None
+            return None, None, None, None
         message = messages[0]
         sender = message.get("from")
         message_type = message.get("type", "unknown")
         text = message.get("text", {}).get("body", "") if message_type == "text" else ""
-        return sender, text, message_type
+        media = None
+        if message_type in ("image", "audio"):
+            info = message.get(message_type) or {}
+            media = {
+                "id": info.get("id"),
+                "mime_type": info.get("mime_type", ""),
+                "caption": info.get("caption", ""),
+            }
+        return sender, text, message_type, media
     except (KeyError, IndexError, TypeError):
-        return None, None, None
+        return None, None, None, None
 
 
 @app.route("/webhook", methods=["GET"])
@@ -155,22 +169,38 @@ def receive_webhook():
         abort(403)
 
     payload = request.get_json(silent=True) or {}
-    sender, text, message_type = _extract_incoming_message(payload)
+    sender, text, message_type, media = _extract_incoming_message(payload)
 
     if sender:
         # Itai writing is what reopens WhatsApp's 24-hour window, and the
         # proactive side has no other way to know when that happened. Recorded
-        # for any message type - an unsupported voice note reopens it too.
+        # for any message type - even a video we cannot watch reopens it too.
         storage.note_inbound(sender)
 
     if sender and message_type == "text" and text:
         reply_text = handle_whatsapp_message(text.strip(), sender_id=sender)
         _send_whatsapp_reply(sender, reply_text)
+    elif sender and message_type == "image" and media and media.get("id"):
+        image_bytes, mime = media_tools.download_media(media["id"])
+        if image_bytes:
+            reply_text = handle_image_message(
+                image_bytes, mime or media["mime_type"],
+                media.get("caption", ""), sender_id=sender)
+        else:
+            reply_text = "קיבלתי ששלחת תמונה, אבל ההורדה שלה מוואטסאפ נכשלה. אפשר לשלוח אותה שוב?"
+        _send_whatsapp_reply(sender, reply_text)
+    elif sender and message_type == "audio" and media and media.get("id"):
+        audio_bytes, mime = media_tools.download_media(media["id"])
+        if audio_bytes:
+            reply_text = handle_voice_message(audio_bytes, mime or media["mime_type"], sender_id=sender)
+        else:
+            reply_text = "קיבלתי ששלחת הודעה קולית, אבל ההורדה שלה מוואטסאפ נכשלה. אפשר לשלוח אותה שוב?"
+        _send_whatsapp_reply(sender, reply_text)
     elif sender and message_type is not None:
-        # A real message of a type we don't handle (voice note, image, location...) -
+        # A real message of a type we don't handle (video, document, location...) -
         # reply so the person knows the bot saw it, instead of silence that looks broken.
         logger.info(f"Unsupported message type '{message_type}' from {sender} — replying with guidance.")
-        _send_whatsapp_reply(sender, "כרגע אני תומך רק בהודעות טקסט. אפשר לתאר את זה במילים? 🙂")
+        _send_whatsapp_reply(sender, "כרגע אני מבין טקסט, תמונות והודעות קוליות. את זה אפשר לתאר במילים? 🙂")
     else:
         logger.info("Webhook event with no incoming message (status update, etc.) — ignored.")
 

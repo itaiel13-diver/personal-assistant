@@ -652,6 +652,17 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
     calls automatically when Gemini triggers them.
     """
     try:
+        # A stated coin holding ("יש לי 0.35 ביטקוין") is stored in code,
+        # never through the model: the amount becomes portfolio data the
+        # evening review trusts, so no model gets to mishear it - and this
+        # works even after the daily AI quota runs out.
+        import portfolio
+        crypto_reply = portfolio.handle_crypto_message(incoming_text)
+        if crypto_reply:
+            if storage.enabled():
+                storage.append_user_turn(sender_id, incoming_text)
+                storage.append_model_turn(sender_id, crypto_reply)
+            return crypto_reply
         # Each message starts with its own search budget. Gemini's automatic
         # function calling will make up to ten tool calls in a single turn if
         # nothing stops it, and on a live question it did exactly that; the

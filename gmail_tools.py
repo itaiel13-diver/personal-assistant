@@ -366,3 +366,70 @@ def list_inbox_messages(query: str = "is:unread in:inbox", max_results: int = 10
     except Exception as e:
         logger.error(f"Gmail inbox listing failed: {e}")
         return []
+
+
+def list_unanswered_sent(quiet_days: int = 3, window_days: int = 14,
+                         max_threads: int = 15) -> list:
+    """Mail Itai sent that nobody has answered. For code, not for the model.
+
+    The quiet leak in any field job is not the inbox - it is the thing he asked
+    someone for a week ago and never got. Gmail will not tell you this directly,
+    so it is assembled from two cheap calls: list the threads he wrote in during
+    the window, then look at each thread and see whose message is last. If his
+    is, nobody has replied.
+
+    quiet_days is the grace before a thread counts as unanswered; window_days is
+    how far back to bother looking, because a mail from last month is not
+    something a nudge fixes.
+
+    Returns [] on any failure - a routine that cannot reach Gmail falls silent
+    rather than raising into the heartbeat.
+    """
+    try:
+        service = _gmail_service()
+        query = (
+            f"in:sent -in:chats -in:trash "
+            f"newer_than:{window_days}d older_than:{quiet_days}d"
+        )
+        listing = service.users().messages().list(
+            userId="me", q=query, maxResults=max_threads * 2
+        ).execute()
+
+        found = []
+        seen_threads = set()
+        for ref in listing.get("messages", []):
+            if len(found) >= max_threads:
+                break
+            thread_id = ref.get("threadId")
+            # A thread he wrote in three times is one thing to chase, not three.
+            if not thread_id or thread_id in seen_threads:
+                continue
+            seen_threads.add(thread_id)
+
+            thread = service.users().threads().get(
+                userId="me", id=thread_id, format="metadata",
+                metadataHeaders=["To", "Subject", "From"],
+            ).execute()
+            messages = thread.get("messages") or []
+            if not messages:
+                continue
+
+            last = messages[-1]
+            # The whole test: if the newest message in the thread is still his,
+            # the other side has not written back.
+            if "SENT" not in (last.get("labelIds") or []):
+                continue
+
+            found.append({
+                "id": last.get("id"),
+                "thread_id": thread_id,
+                "recipient": _header(last, "To"),
+                "subject": _header(last, "Subject"),
+                # Epoch milliseconds, which is the one date field Gmail gives
+                # that needs no parsing and is never in the sender's timezone.
+                "sent_at_ms": int(last.get("internalDate") or 0),
+            })
+        return found
+    except Exception as e:
+        logger.error(f"Gmail sent-mail scan failed: {e}")
+        return []

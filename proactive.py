@@ -280,7 +280,91 @@ def reminders(now: datetime) -> list:
     return due
 
 
-ROUTINES = (attendance, reminders, new_mail)
+# --- mail he sent that nobody answered -----------------------------------
+#
+# The other direction of the inbox, and the one nobody watches. A store manager
+# who never answered about a broken display is not in any inbox, any list or
+# any calendar - the request simply stopped existing the moment he sent it.
+# Threads he wrote in are cheap to list and cheap to check: if the newest
+# message in the thread is still his, nobody wrote back.
+#
+# This runs once a day rather than every tick. It costs a Gmail call per thread
+# and, unlike an unread email, nothing about it changes between 09:30 and 10:00.
+
+CHASE_AT = time(9, 30)
+
+# Three days is long enough that silence means something and short enough that
+# the thing he asked for can still arrive on time.
+CHASE_QUIET_DAYS = 3
+
+# Past two weeks a nudge is not what fixes it, and raising it only tells him
+# something he has already decided to live with.
+CHASE_WINDOW_DAYS = 14
+
+# Three a morning. This is the one routine whose backlog is unbounded on the
+# first run - every unanswered mail of the last fortnight arrives at once - and
+# thirty messages at 09:30 is how he learns to ignore the assistant.
+CHASE_PER_DAY = 3
+
+# Python numbers Monday 0.
+HEBREW_DAYS = ("שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון")
+
+
+def _person(header: str) -> str:
+    """'Dana Levi <dana@impact.co.il>' -> 'Dana Levi'. The name is what he
+    recognises; the address is noise on a phone screen."""
+    value = (header or "").split(",")[0].strip()
+    if "<" in value:
+        name = value.split("<")[0].strip().strip('"')
+        if name:
+            return name
+        value = value.split("<")[1].rstrip(">").strip()
+    return value or "מישהו"
+
+
+def _chase_text(row: dict, now: datetime) -> str:
+    sent = datetime.fromtimestamp(row["sent_at_ms"] / 1000, ISRAEL_TZ)
+    days = (now.date() - sent.date()).days
+    # Inside a week the day name is what he remembers the mail by; past that it
+    # stops being a landmark and the date says more.
+    when = f"ביום {HEBREW_DAYS[sent.weekday()]}" if days <= 6 else f"ב-{sent:%d/%m}"
+    subject = row.get("subject") or "(ללא נושא)"
+    return "\n".join([
+        "📮 *מייל שלא נענה*",
+        f"שלחת ל{_person(row.get('recipient'))} {when} (לפני {days} ימים):",
+        f"נושא: {subject}",
+        "",
+        f'מאז אין תשובה. רוצה שאזכיר לך לחזור אליהם? תגיד לי מתי — או [id:{row.get("id")}] כדי שאקרא מה שלחת.',
+    ])
+
+
+def unanswered_mail(now: datetime) -> list:
+    """Threads Itai wrote in and nobody wrote back to."""
+    if now.weekday() not in WORK_DAYS:
+        return []
+    if _is_due(now, CHASE_AT) < 0:
+        return []
+
+    from gmail_tools import list_unanswered_sent
+
+    due = []
+    for row in list_unanswered_sent(CHASE_QUIET_DAYS, CHASE_WINDOW_DAYS):
+        if len(due) >= CHASE_PER_DAY:
+            break
+        # Nobody is ignoring him at no-reply@samsung.com.
+        if triage.is_machine_address(row.get("recipient")):
+            continue
+        # Keyed on the message rather than the thread: if he writes into the
+        # thread again and is met with silence again, that is a new fact and
+        # worth raising once more.
+        fingerprint = f"chase:{row['thread_id']}:{row['sent_at_ms']}"
+        if not storage.claim(fingerprint, "chase"):
+            continue
+        due.append(Due(fingerprint, "chase", _chase_text(row, now), preclaimed=True))
+    return due
+
+
+ROUTINES = (attendance, reminders, unanswered_mail, new_mail)
 
 
 # --- the tick ------------------------------------------------------------

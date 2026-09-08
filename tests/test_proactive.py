@@ -156,6 +156,24 @@ def inbox(monkeypatch):
     return fill
 
 
+@pytest.fixture(autouse=True)
+def sent(monkeypatch):
+    """Same idea for the chaser: nothing unanswered unless a test says so."""
+    import gmail_tools
+
+    box = []
+    monkeypatch.setattr(
+        gmail_tools, "list_unanswered_sent",
+        lambda quiet_days=3, window_days=14, max_threads=15: box[:max_threads],
+    )
+
+    def fill(*rows):
+        box.clear()
+        box.extend(rows)
+        return box
+    return fill
+
+
 def mail(id, sender="dana@impact.co.il", subject="נושא", snippet="גוף ההודעה",
          list_unsubscribe="", labels=None):
     return {"id": id, "sender": sender, "subject": subject,
@@ -718,3 +736,117 @@ def test_a_shut_window_gives_back_a_mail_it_could_not_deliver(ledger, inbox):
 
     proactive.run_tick(Outbox(), now=now, routines=(proactive.new_mail,))
     assert fake.released == ["mail:held"]
+
+
+# --- the chaser ----------------------------------------------------------
+
+
+def sent_mail(thread="t1", id="m1", recipient="Dana Levi <dana@impact.co.il>",
+              subject="מחירון ספטמבר", when=None):
+    when = when or at(SUNDAY, "09:00")
+    return {"id": id, "thread_id": thread, "recipient": recipient,
+            "subject": subject, "sent_at_ms": int(when.timestamp() * 1000)}
+
+
+def test_a_mail_nobody_answered_is_raised_by_name_and_day(ledger, sent):
+    now = at("2026-09-10", "09:30")          # Thursday
+    ledger(now=now)
+    sent(sent_mail(when=at(SUNDAY, "09:00")))
+
+    due = proactive.unanswered_mail(now)
+    assert len(due) == 1
+    assert due[0].kind == "chase"
+    assert "Dana Levi" in due[0].text
+    assert "ביום ראשון" in due[0].text
+    assert "לפני 4 ימים" in due[0].text
+    assert "מחירון ספטמבר" in due[0].text
+    # It hands straight back to the two things he can do about it.
+    assert "[id:m1]" in due[0].text
+
+
+def test_the_chaser_runs_once_a_day_not_once_a_tick(ledger, sent):
+    fake = ledger(now=at("2026-09-10", "09:30"))
+    sent(sent_mail())
+
+    assert len(proactive.unanswered_mail(at("2026-09-10", "09:30"))) == 1
+    # Still inside the grace window, and the mail is still unanswered.
+    assert proactive.unanswered_mail(at("2026-09-10", "10:00")) == []
+    assert len(fake.claimed) == 1
+
+
+def test_the_chaser_is_quiet_outside_its_slot(ledger, sent):
+    ledger(now=at("2026-09-10", "14:00"))
+    sent(sent_mail())
+    assert proactive.unanswered_mail(at("2026-09-10", "14:00")) == []
+
+
+def test_the_chaser_does_not_work_on_a_friday(ledger, sent):
+    ledger(now=at(FRIDAY, "09:30"))
+    sent(sent_mail())
+    assert proactive.unanswered_mail(at(FRIDAY, "09:30")) == []
+
+
+def test_nobody_is_ignoring_him_at_a_no_reply_address(ledger, sent):
+    now = at("2026-09-10", "09:30")
+    ledger(now=now)
+    sent(sent_mail(recipient="no-reply@samsung.com"))
+    assert proactive.unanswered_mail(now) == []
+
+
+def test_a_first_run_does_not_arrive_as_thirty_messages(ledger, sent):
+    now = at("2026-09-10", "09:30")
+    ledger(now=now)
+    sent(*[sent_mail(thread=f"t{i}", id=f"m{i}") for i in range(12)])
+
+    first = proactive.unanswered_mail(now)
+    assert len(first) == proactive.CHASE_PER_DAY
+    # The rest are not claimed, so tomorrow's run picks them up.
+    assert [item.fingerprint for item in first] == [
+        f"chase:t{i}:{first[0].fingerprint.split(':')[-1]}" for i in range(3)
+    ]
+
+
+def test_writing_into_the_thread_again_makes_it_chaseable_again(ledger, sent):
+    now = at("2026-09-10", "09:30")
+    ledger(now=now)
+    sent(sent_mail(thread="t1", id="m1", when=at(SUNDAY, "09:00")))
+    assert len(proactive.unanswered_mail(now)) == 1
+
+    # He wrote again on Monday; still no answer by the following Thursday.
+    later = at("2026-09-17", "09:30")
+    sent(sent_mail(thread="t1", id="m9", when=at("2026-09-07", "09:00")))
+    assert len(proactive.unanswered_mail(later)) == 1
+
+
+def test_an_old_mail_is_dated_rather_than_named_by_its_day(ledger, sent):
+    now = at("2026-09-17", "09:30")
+    ledger(now=now)
+    sent(sent_mail(when=at("2026-09-06", "09:00")))
+    text = proactive.unanswered_mail(now)[0].text
+    assert "ב-06/09" in text
+    assert "ביום" not in text
+
+
+def test_a_recipient_with_no_display_name_is_still_addressed(ledger, sent):
+    now = at("2026-09-10", "09:30")
+    ledger(now=now)
+    sent(sent_mail(recipient="dana@impact.co.il"))
+    assert "dana@impact.co.il" in proactive.unanswered_mail(now)[0].text
+
+
+def test_gmail_falling_over_does_not_stop_the_chaser_taking_the_tick_down(ledger, monkeypatch):
+    import gmail_tools
+
+    def broken(*a, **k):
+        raise RuntimeError("Gmail is down")
+
+    now = at("2026-09-10", "09:30")
+    ledger(now=now)
+    monkeypatch.setattr(gmail_tools, "list_unanswered_sent", broken)
+    outbox = Outbox()
+    # 09:30 is still inside the grace on the 08:55 clock-in slot, so this says
+    # the one routine that costs him money survives the one that cannot reach
+    # Gmail.
+    summary = proactive.run_tick(outbox, now=now)
+    assert len(outbox.sent) == 1
+    assert "רישום כניסה" in outbox.sent[0][1]

@@ -113,6 +113,14 @@ def _text_of(message: dict) -> str:
     ))
 
 
+def is_machine_address(value: str) -> bool:
+    """True for an address nobody reads a reply from - a no-reply, a bounce
+    handler, a mailing platform. Used on the From header when sorting incoming
+    mail, and on the To header when deciding whether an unanswered email is
+    worth chasing: nobody is ignoring him at no-reply@samsung.com."""
+    return bool(_MACHINE_SENDER.search(str(value or "")))
+
+
 def is_bulk(message: dict) -> bool:
     """Structural evidence that this was sent to a list, not to Itai."""
     # Present on every mail sent through a mailing platform, and on nothing a
@@ -122,7 +130,7 @@ def is_bulk(message: dict) -> bool:
     labels = message.get("labels") or []
     if any(label in BULK_LABELS for label in labels):
         return True
-    if _MACHINE_SENDER.search(str(message.get("sender") or "")):
+    if is_machine_address(message.get("sender")):
         return True
     haystack = _text_of(message).lower()
     return any(phrase in haystack for phrase in _BULK_PHRASES)

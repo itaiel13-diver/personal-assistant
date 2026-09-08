@@ -346,7 +346,7 @@ def list_inbox_messages(query: str = "is:unread in:inbox", max_results: int = 10
         for ref in listing.get("messages", []):
             msg = service.users().messages().get(
                 userId="me", id=ref["id"], format="metadata",
-                metadataHeaders=["From", "Subject", "Date"],
+                metadataHeaders=["From", "Subject", "Date", "List-Unsubscribe"],
             ).execute()
             found.append({
                 "id": ref["id"],
@@ -355,6 +355,12 @@ def list_inbox_messages(query: str = "is:unread in:inbox", max_results: int = 10
                 "date": _header(msg, "Date"),
                 # Gmail's own one-line preview, free with the metadata call.
                 "snippet": (msg.get("snippet") or "").strip(),
+                # The two fields triage.py sorts on, both free with this same
+                # call. List-Unsubscribe is present on everything sent through
+                # a mailing platform and on nothing a person typed; the labels
+                # carry Gmail's own promotions/social/updates classification.
+                "list_unsubscribe": _header(msg, "List-Unsubscribe"),
+                "labels": msg.get("labelIds") or [],
             })
         return found
     except Exception as e:

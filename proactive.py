@@ -35,6 +35,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import storage
+import triage
 
 logger = logging.getLogger(__name__)
 
@@ -167,21 +168,36 @@ WAKING_START = time(7, 0)
 WAKING_END = time(22, 30)
 
 
-def _mail_text(message: dict) -> str:
+def _mail_text(message: dict, drawer: str) -> str:
     subject = message.get("subject") or "(ללא נושא)"
-    lines = ["📬 *מייל חדש*", f"מאת: {message.get('sender', '')}", f"נושא: {subject}"]
+    if drawer == triage.REPLY:
+        head = "📬 *מייל שמחכה לתשובה ממך*"
+    else:
+        head = "📬 *מייל חדש*"
+    lines = [head, f"מאת: {message.get('sender', '')}", f"נושא: {subject}"]
     snippet = (message.get("snippet") or "")[:280]
     if snippet:
         lines += ["", snippet]
     # The id is printed in the same [id:...] form search_emails uses, so when
     # Itai answers, the model finds it in its own history and can go straight
     # to read_email instead of searching the mailbox again.
-    lines += ["", f'רוצה שאקרא ואסכם? תגיד לי [id:{message.get("id")}]']
+    if drawer == triage.REPLY:
+        tail = f'רוצה שאקרא ואציע לך תשובה? תגיד לי [id:{message.get("id")}]'
+    else:
+        tail = f'רוצה שאקרא ואסכם? תגיד לי [id:{message.get("id")}]'
+    lines += ["", tail]
     return "\n".join(lines)
 
 
 def new_mail(now: datetime) -> list:
-    """Raises unread mail Itai has not been told about yet, one message each."""
+    """Raises unread mail Itai has not been told about yet, one message each.
+
+    Not every unread email becomes a message any more. Each one is sorted into
+    a drawer first (see triage.py) and the ignore drawer is delivered by not
+    delivering it: the claim is still written, under a kind of its own, so the
+    email is never looked at again and there is a record of what was silenced
+    and when. Only notify and reply reach his phone.
+    """
     if not (WAKING_START <= now.time() <= WAKING_END):
         return []
 
@@ -189,16 +205,31 @@ def new_mail(now: datetime) -> list:
     # client, and the heartbeat framework should stay importable without it.
     from gmail_tools import list_inbox_messages
 
-    due = []
+    # Claimed before triage, not after, so an email cannot be sorted twice by
+    # two overlapping ticks - and so the ones already raised do not go back
+    # through the model on every tick for the rest of the day.
+    fresh = []
     for message in list_inbox_messages(MAIL_QUERY, max_results=10):
-        if len(due) >= MAIL_PER_TICK:
+        if len(fresh) >= MAIL_PER_TICK:
             break
+        if storage.claim(f"mail:{message['id']}", "mail"):
+            fresh.append(message)
+    if not fresh:
+        return []
+
+    drawers = triage.triage(fresh)
+
+    due = []
+    for message in fresh:
         fingerprint = f"mail:{message['id']}"
-        # Claimed here, before the decision, so an email that has already been
-        # raised is not looked at again on every tick for the rest of the day.
-        if not storage.claim(fingerprint, "mail"):
+        drawer = drawers.get(message["id"], triage.NOTIFY)
+        if drawer == triage.IGNORE:
+            # Re-stamped rather than released: released would mean "look at it
+            # again next tick", and the whole point is that this one is done.
+            storage.restamp(fingerprint, "mail-ignored")
+            logger.info("Mail %s muted by triage: %s", message["id"], message.get("subject"))
             continue
-        due.append(Due(fingerprint, "mail", _mail_text(message), preclaimed=True))
+        due.append(Due(fingerprint, f"mail-{drawer}", _mail_text(message, drawer), preclaimed=True))
     return due
 
 

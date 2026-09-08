@@ -40,6 +40,7 @@ class FakeLedger:
     def __init__(self, sender="972500000000", wrote_at=_DEFAULT, now=None):
         self.claimed = set()
         self.released = []
+        self.restamped = []
         self.turns = []
         self.reminders = []
         self.unclaimed = []
@@ -61,6 +62,10 @@ class FakeLedger:
     def release(self, fingerprint):
         self.claimed.discard(fingerprint)
         self.released.append(fingerprint)
+
+    def restamp(self, fingerprint, kind):
+        # The claim stays; only what it is recorded as changes.
+        self.restamped.append((fingerprint, kind))
 
     def last_inbound(self):
         return (self.sender, self.wrote_at)
@@ -106,12 +111,25 @@ class Outbox:
 def ledger(monkeypatch):
     def install(now=None, **kwargs):
         fake = FakeLedger(now=now, **kwargs)
-        for name in ("enabled", "claim", "release", "last_inbound",
+        for name in ("enabled", "claim", "release", "restamp", "last_inbound",
                      "append_model_turn", "claim_due_reminders",
                      "unclaim_reminder", "reschedule_reminder"):
             monkeypatch.setattr(proactive.storage, name, getattr(fake, name))
         return fake
     return install
+
+
+@pytest.fixture(autouse=True)
+def rules_only(monkeypatch):
+    """Mail triage runs on its rules here, with no model behind it.
+
+    That is also the shipped default until a Groq key is set, so these tests
+    exercise the configuration production is actually in - and a machine that
+    happens to have a key in its environment cannot turn them into network
+    calls.
+    """
+    import triage
+    monkeypatch.setattr(triage.llm, "ask_json", lambda *a, **k: None)
 
 
 @pytest.fixture(autouse=True)
@@ -138,9 +156,11 @@ def inbox(monkeypatch):
     return fill
 
 
-def mail(id, sender="dana@impact.co.il", subject="נושא", snippet="גוף ההודעה"):
+def mail(id, sender="dana@impact.co.il", subject="נושא", snippet="גוף ההודעה",
+         list_unsubscribe="", labels=None):
     return {"id": id, "sender": sender, "subject": subject,
-            "snippet": snippet, "date": ""}
+            "snippet": snippet, "date": "", "list_unsubscribe": list_unsubscribe,
+            "labels": labels or ["INBOX", "UNREAD"]}
 
 
 # --- the attendance routine ---------------------------------------------
@@ -625,3 +645,76 @@ def test_a_broken_reschedule_does_not_lose_the_rest_of_the_queue(ledger):
 
     proactive.run_tick(out, now=now, routines=(proactive.reminders,))
     assert len(out.sent) == 2
+
+
+# --- the drawers, where the mail watch meets triage ----------------------
+
+
+def test_a_newsletter_never_reaches_his_pocket(ledger, inbox):
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    inbox(mail("nl", sender="no-reply@samsung.com", subject="Samsung Weekly"))
+
+    assert proactive.new_mail(now) == []
+    # Silenced, not forgotten: the claim stays so it is never examined again,
+    # and it is stamped with what happened to it.
+    assert "mail:nl" in fake.claimed
+    assert fake.restamped == [("mail:nl", "mail-ignored")]
+
+
+def test_a_silenced_email_is_not_reconsidered_on_the_next_tick(ledger, inbox):
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    inbox(mail("nl", list_unsubscribe="<https://x.com/u/1>"))
+
+    assert proactive.new_mail(now) == []
+    assert proactive.new_mail(at(SUNDAY, "11:30")) == []
+    # One stamp, not one per tick - the second tick never looked at it.
+    assert len(fake.restamped) == 1
+
+
+def test_a_mail_someone_is_waiting_on_says_so(ledger, inbox):
+    now = at(SUNDAY, "11:00")
+    ledger(now=now)
+    inbox(mail("q", sender="dana@impact.co.il", snippet="מחכה לתשובה שלך על המחירון"))
+
+    due = proactive.new_mail(now)
+    assert len(due) == 1
+    assert due[0].kind == "mail-reply"
+    assert "מחכה לתשובה ממך" in due[0].text
+    # He can still hand it straight back to the assistant.
+    assert "[id:q]" in due[0].text
+
+
+def test_an_ordinary_email_reads_exactly_as_it_always_did(ledger, inbox):
+    now = at(SUNDAY, "11:00")
+    ledger(now=now)
+    inbox(mail("ord", subject="לוח משמרות"))
+
+    due = proactive.new_mail(now)
+    assert due[0].kind == "mail-notify"
+    assert due[0].text.startswith("📬 *מייל חדש*")
+    assert "רוצה שאקרא ואסכם?" in due[0].text
+
+
+def test_silencing_one_email_does_not_swallow_the_next(ledger, inbox):
+    now = at(SUNDAY, "11:00")
+    ledger(now=now)
+    inbox(
+        mail("junk", sender="no-reply@x.com"),
+        mail("real", sender="dana@impact.co.il", subject="חוסר במלאי ברמלה"),
+    )
+
+    due = proactive.new_mail(now)
+    assert [item.fingerprint for item in due] == ["mail:real"]
+
+
+def test_a_shut_window_gives_back_a_mail_it_could_not_deliver(ledger, inbox):
+    # Triage decided it was worth saying; the window decided it could not be
+    # said. The claim has to come back or he is never told.
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now, wrote_at=now - timedelta(hours=30))
+    inbox(mail("held", snippet="נא לאשר את ההזמנה"))
+
+    proactive.run_tick(Outbox(), now=now, routines=(proactive.new_mail,))
+    assert fake.released == ["mail:held"]

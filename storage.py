@@ -286,6 +286,30 @@ def claim(fingerprint: str, kind: str) -> bool:
         return False
 
 
+def restamp(fingerprint: str, kind: str) -> None:
+    """Changes what an existing claim is recorded as, keeping the claim itself.
+
+    The mail watch claims an email before it knows what the email is, so the
+    row starts life as a plain 'mail'. When triage decides nobody should be
+    told about it, the claim must stay - that is what stops the same newsletter
+    being examined again on every tick - but the row should say what actually
+    happened to it, so the silenced mail is auditable rather than invisible.
+    """
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE proactive_log SET kind = %s WHERE fingerprint = %s",
+                    (kind, fingerprint),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to restamp proactive item {fingerprint}: {e}")
+
+
 def release(fingerprint: str) -> None:
     """Undoes a claim whose message never actually went out, so the next tick
     may try again while the item is still worth raising."""

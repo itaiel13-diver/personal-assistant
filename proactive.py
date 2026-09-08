@@ -435,6 +435,51 @@ def daily_question(now: datetime) -> list:
     )]
 
 
+# --- the evening summary ----------------------------------------------------
+#
+# The close of the day, in the shape Itai asked for: what he did, what the day
+# left open, the football, his stocks. The composition - including the one
+# model call a day this costs - lives in evening_summary.py; what lives here
+# is the same discipline every other routine keeps: the day is claimed before
+# a single external call happens, and a message that never goes out gives the
+# claim back so the next tick can try again inside the grace window.
+
+EVENING_SUMMARY_AT = time(20, 0)
+
+
+def evening_summary(now: datetime) -> list:
+    """The 20:00 close-of-day message."""
+    if _is_due(now, EVENING_SUMMARY_AT) < 0:
+        return []
+
+    day = f"evening:{now:%Y-%m-%d}"
+    if not storage.claim(day, "evening-summary"):
+        return []
+
+    import evening_summary as summary
+
+    try:
+        number, _ = _recipient(now)
+        text = summary.build_message(now, number or "")
+    except Exception:
+        storage.release(day)
+        raise
+
+    if not text:
+        # Nothing to say is a real outcome, not an error: the claim stays, or
+        # the next tick would rebuild (and re-spend the model call) for the
+        # same empty answer.
+        return []
+
+    return [Due(
+        day,
+        "evening-summary",
+        text,
+        preclaimed=True,
+        on_failed=lambda: storage.release(day),
+    )]
+
+
 def shared_files_mirror(now: datetime) -> list:
     """Keeps the working folder a live mirror of everything shared with the bot.
 
@@ -454,7 +499,7 @@ def shared_files_mirror(now: datetime) -> list:
 
 
 ROUTINES = (attendance, reminders, unanswered_mail, new_mail, daily_question,
-            shared_files_mirror)
+            evening_summary, shared_files_mirror)
 
 
 # --- the tick ------------------------------------------------------------

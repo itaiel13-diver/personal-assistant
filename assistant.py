@@ -31,7 +31,9 @@ from calendar_tools import (
     update_calendar_event,
 )
 from drive_tools import (
+    append_drive_file,
     create_drive_file,
+    create_drive_folder,
     list_bot_shares,
     list_drive_folder,
     read_drive_file,
@@ -189,6 +191,27 @@ GOOGLE DRIVE:
   flag on your own initiative. Use it only after he has said, in this conversation and
   about this specific file, that he wants it gone permanently - and if there is any
   doubt at all, bin it instead and tell him he can empty the bin himself.
+- HARD RULE from Itai (2026-09-08): NEVER edit, append to, bin or delete a file
+  that anyone besides him and the bot can see - a colleague it was shared with,
+  a group, a domain, or "anyone with the link" - unless he has explicitly
+  approved THAT specific change to THAT specific file in this conversation.
+  The tools enforce it: the attempt is refused and the refusal names who else
+  can see the file. When that happens, quote the names to him and ask; only
+  after his explicit yes, call again with confirmed_shared_edit=True. His yes
+  to one file is never approval for another.
+- You CAN create folders inside the working folder with create_drive_folder,
+  and create files in those subfolders (create_drive_file with folder_id).
+  Everything you make still lives in that one tree, nowhere else.
+- To add rows to a tracking sheet or lines to a log, use append_drive_file -
+  it keeps what is already there. Never replace a tracking file's whole
+  contents just to add one row.
+- VOC tracking: when he tells you about a VOC - a visit, a rep conversation,
+  field feedback worth keeping - log it as a row in the monthly sheet named
+  "VOC <MM/YYYY>" inside the "מעקב VOC" subfolder of the working folder
+  (create the folder and the sheet if missing; sheet header row:
+  תאריך,נקודת מכירה,נציג,נושא,מה סוכם,צעד הבא). One row per VOC, appended -
+  so his evening-summary answer "did a VOC I didn't write down" lands in the
+  table without him writing anything twice.
 - If you are not certain which file he means, search first and read him the names you
   found. Deleting the wrong file is the one mistake here he will feel.
 - Never "clear" a file by updating it to nothing. That is deletion wearing a hat, and
@@ -424,6 +447,8 @@ tools_list = [
     save_to_drive_folder,
     list_bot_shares,
     create_drive_file,
+    create_drive_folder,
+    append_drive_file,
     update_drive_file,
     trash_drive_file,
     create_reminder,

@@ -45,7 +45,16 @@ The three rules this module keeps:
      edit is refused unless the file is already in that folder. Everything
      outside it is readable and not writable.
 
-Rules 2-3 are enforced by a test that reads this file's syntax tree, on the
+  4. It never edits or deletes a file that anyone besides Itai and the bot
+     can see, unless Itai has approved that exact change in the conversation.
+     His rule, stated 2026-09-08. The check is mechanical - the file's
+     permissions are read before the write, and a third party (a person, a
+     group, a domain, or "anyone with the link") turns the call into a
+     refusal naming them - because a document altered by the assistant under
+     a colleague's eyes is a mistake that cannot be un-seen. His explicit
+     yes lifts the refusal for that call and no other.
+
+Rules 2-4 are enforced by tests that read this file's syntax tree, on the
 model of test_module_exposes_no_way_to_send_mail. If a future change needs one
 of them relaxed, that test is the conversation - not an obstacle to route
 around. Rule 1 had that conversation, and the answer was yes.
@@ -80,6 +89,23 @@ CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 # The one folder the assistant may write into. Without it every write is
 # refused - an unset folder means "nowhere", never "anywhere".
 FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
+
+# Who "Itai and the bot" are when the shared-file edit guard asks who may see
+# a file: his own addresses (configurable, because they drift) plus the
+# service account, read from its key at check time. Anyone else - a colleague
+# the file was shared with, a group, a domain, or "anyone with the link" -
+# makes an edit require his explicit approval first. His rule, 2026-09-08.
+OWNER_EMAILS = frozenset(
+    e.strip().lower()
+    for e in os.environ.get(
+        "DRIVE_OWNER_EMAILS", "itaiel13@gmail.com,itai.samsung.isr@gmail.com"
+    ).split(",")
+    if e.strip()
+)
+
+# How far above a subfolder the guard walks looking for the working folder.
+# Deeper nesting than this is not a place the assistant writes.
+MAX_FOLDER_DEPTH = 4
 
 MAX_RESULTS = 15
 MAX_LISTING_CHARS = 4000
@@ -297,6 +323,108 @@ def _parents(file_id: str) -> list:
         fileId=file_id, fields="parents", supportsAllDrives=True
     ).execute()
     return meta.get("parents") or []
+
+
+def _third_party_access(file_id: str, service, meta: dict | None = None):
+    """Who besides Itai and the bot can open this file.
+
+    Returns a list of names/emails (empty when only the two allowed parties
+    have access), or None when the sharing state cannot be determined - which
+    the caller must treat as shared, because guessing wrong exposes the file
+    to an edit a colleague would see.
+
+    Read as a FIELD on files().get, never through the permissions() endpoint:
+    the no-permissions() rule above is about changing who can see a file, and
+    keeping it literally true - no call, no attribute - is what lets the
+    guard test stay simple."""
+    if meta is None:
+        meta = service.files().get(
+            fileId=file_id,
+            fields="permissions(emailAddress,role,type,domain,displayName)",
+            supportsAllDrives=True,
+        ).execute()
+    perms = meta.get("permissions")
+    if perms is None:
+        return None
+    allowed = OWNER_EMAILS | ({_sa_email().lower()} if _sa_email() else set())
+    outsiders = []
+    for perm in perms:
+        ptype = perm.get("type", "")
+        email = (perm.get("emailAddress") or "").lower()
+        if ptype == "user" and email and email in allowed:
+            continue
+        outsiders.append(
+            email
+            or (perm.get("displayName") or "").strip()
+            or (perm.get("domain") or "").strip()
+            or ("כל מי שיש לו קישור" if ptype == "anyone" else ptype or "גורם לא ידוע")
+        )
+    return outsiders
+
+
+def _check_shared_edit(file_id: str, service, confirmed: bool,
+                       meta: dict | None = None):
+    """The hard rule Itai set on 2026-09-08: the assistant never edits or
+    deletes a file that anyone besides him and the bot can see, unless he has
+    approved that exact change in the conversation. Returns the refusal text
+    to hand back, or None when the write may proceed.
+
+    `confirmed` is the model's way of carrying his yes into the call - the
+    tool descriptions allow it only after he approved this specific file in
+    words, and a routine or heartbeat has no way to pass it at all."""
+    if confirmed:
+        return None
+    try:
+        outsiders = _third_party_access(file_id, service, meta)
+    except Exception as e:
+        logger.error(f"Sharing check failed for {file_id!r}: {e}")
+        outsiders = None
+    if outsiders is None:
+        return (
+            "לא הצלחתי לבדוק עם מי הקובץ משותף, ולכן אני לא משנה אותו. "
+            "אם איתי אישר במפורש בשיחה הזו לשנות את הקובץ הזה - "
+            "יש לקרוא שוב עם confirmed_shared_edit=True."
+        )
+    if not outsiders:
+        return None
+    names = ", ".join(outsiders[:5])
+    more = f" ועוד {len(outsiders) - 5}" if len(outsiders) > 5 else ""
+    return (
+        f"הקובץ נגיש גם ל-{names}{more} - לא רק לאיתי ולבוט - ולכן אני לא "
+        "משנה או מוחק אותו בלי אישור מפורש של איתי בשיחה הזו. "
+        "אם הוא אישר, יש לקרוא שוב עם confirmed_shared_edit=True."
+    )
+
+
+def _working_parent(folder_id: str) -> str:
+    """Where a new item may actually be created: the working folder itself, or
+    a folder inside it (a subfolder of a subfolder, to a sane depth). Any
+    other answer is "" - writes stay inside the one tree, and a folder id
+    that leads anywhere else is simply not a place the assistant writes."""
+    folder_id = (folder_id or "").strip()
+    if not folder_id or folder_id == FOLDER_ID:
+        return FOLDER_ID
+    current, seen = folder_id, set()
+    for depth in range(MAX_FOLDER_DEPTH):
+        if current in seen:
+            return ""
+        seen.add(current)
+        try:
+            meta = _drive_service().files().get(
+                fileId=current, fields="mimeType, parents", supportsAllDrives=True
+            ).execute()
+        except Exception as e:
+            logger.error(f"Folder containment check failed for {current!r}: {e}")
+            return ""
+        if depth == 0 and meta.get("mimeType") != FOLDER_MIME:
+            return ""
+        parents = meta.get("parents") or []
+        if FOLDER_ID in parents:
+            return folder_id
+        if not parents:
+            return ""
+        current = parents[0]
+    return ""
 
 
 def _refuse_write(reason: str) -> str:
@@ -594,7 +722,8 @@ def _read_with_service(service, file_id: str, part: int) -> str:
     return attachment_readers.extract_text(filename, raw, mime_type=mime, part=part)
 
 
-def create_drive_file(name: str, content: str, file_type: str = "doc") -> str:
+def create_drive_file(name: str, content: str, file_type: str = "doc",
+                      folder_id: str = "") -> str:
     """Creates a new file in the assistant's working folder in Drive.
 
     Use it when Itai asks for something written down rather than said: a
@@ -609,6 +738,9 @@ def create_drive_file(name: str, content: str, file_type: str = "doc") -> str:
             line, cells separated by commas.
         file_type: 'doc' for a Google Doc, 'sheet' for a Google Sheet, 'text'
             for a plain text file.
+        folder_id: Optional - a folder INSIDE the working folder (for example
+            one made with create_drive_folder) to create the file in. Any
+            folder outside the working folder is refused.
 
     Returns:
         Confirmation with the new file's id and a link, or the reason it failed.
@@ -619,6 +751,9 @@ def create_drive_file(name: str, content: str, file_type: str = "doc") -> str:
         return _refuse_write("צריך שם לקובץ.")
     if not FOLDER_ID:
         return _refuse_write("לא הוגדרה תיקיית עבודה בדרייב (DRIVE_FOLDER_ID), אז אין לאן לכתוב.")
+    parent = _working_parent(folder_id)
+    if not parent:
+        return _refuse_write("התיקייה שצוינה לא נמצאת בתוך תיקיית העבודה, אז אי אפשר לכתוב בה.")
 
     targets = {
         "doc": ("application/vnd.google-apps.document", "text/plain"),
@@ -635,7 +770,7 @@ def create_drive_file(name: str, content: str, file_type: str = "doc") -> str:
             io.BytesIO(content.encode("utf-8")), mimetype=upload_mime, resumable=False
         )
         created = _drive_service().files().create(
-            body={"name": name, "mimeType": target_mime, "parents": [FOLDER_ID]},
+            body={"name": name, "mimeType": target_mime, "parents": [parent or FOLDER_ID]},
             media_body=media,
             fields="id, name, webViewLink",
             supportsAllDrives=True,
@@ -650,7 +785,52 @@ def create_drive_file(name: str, content: str, file_type: str = "doc") -> str:
         return f"❌ יצירת הקובץ נכשלה: {e}"
 
 
-def update_drive_file(file_id: str, content: str) -> str:
+def create_drive_folder(name: str, parent_folder_id: str = "") -> str:
+    """Creates a new folder inside the assistant's working folder in Drive.
+
+    Use it to organise what the assistant keeps for Itai - for example a
+    "מעקב VOC" folder holding the monthly tracking sheets. The folder is
+    created as Itai (his OAuth), so it is an ordinary folder in his own
+    Drive that he can open, rename or delete like any other.
+
+    It cannot create a folder anywhere outside the working folder tree.
+
+    Args:
+        name: The folder name.
+        parent_folder_id: Optional - a folder INSIDE the working folder to
+            create the new folder in. Defaults to the working folder itself.
+
+    Returns:
+        Confirmation with the new folder's id and a link, or the reason it failed.
+    """
+    name = (name or "").strip()
+    if not name:
+        return _refuse_write("צריך שם לתיקייה.")
+    if not FOLDER_ID:
+        return _refuse_write("לא הוגדרה תיקיית עבודה בדרייב (DRIVE_FOLDER_ID), אז אין לאן לכתוב.")
+    parent = _working_parent(parent_folder_id)
+    if not parent:
+        return _refuse_write("התיקייה שצוינה לא נמצאת בתוך תיקיית העבודה, אז אי אפשר ליצור בה.")
+
+    logger.info(f"Drive tool: create_drive_folder(name={name!r})")
+    try:
+        created = _drive_service().files().create(
+            body={"name": name, "mimeType": FOLDER_MIME, "parents": [parent or FOLDER_ID]},
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+        link = created.get("webViewLink", "")
+        return (
+            f"✅ נוצרה תיקייה בתיקיית העבודה: {created.get('name')} "
+            f"[id:{created.get('id')}]" + (f"\n{link}" if link else "")
+        )
+    except Exception as e:
+        logger.error(f"create_drive_folder failed for {name!r}: {e}")
+        return f"❌ יצירת התיקייה נכשלה: {e}"
+
+
+def update_drive_file(file_id: str, content: str,
+                      confirmed_shared_edit: bool = False) -> str:
     """Replaces the contents of a file the assistant may edit.
 
     Only files inside the working folder can be edited. Anything else in Itai's
@@ -658,11 +838,20 @@ def update_drive_file(file_id: str, content: str) -> str:
     writable, and an attempt says so rather than failing obscurely.
 
     This REPLACES the whole file. To add to a document, read it first with
-    read_drive_file and send back the old text plus the new.
+    read_drive_file and send back the old text plus the new. To just add lines
+    at the end, use append_drive_file instead.
+
+    A file that anyone besides Itai and the bot can see - a colleague, a
+    group, "anyone with the link" - is never edited without his explicit
+    approval in the conversation. If that applies, this call is refused with
+    the list of who else can see it; ask him in words, and only after he says
+    yes to THIS file, call again with confirmed_shared_edit=True.
 
     Args:
         file_id: The file's Drive id.
         content: The complete new contents.
+        confirmed_shared_edit: True only after Itai explicitly approved
+            editing this specific shared file in this conversation.
 
     Returns:
         Confirmation, or the reason the edit was refused.
@@ -681,19 +870,92 @@ def update_drive_file(file_id: str, content: str) -> str:
                 "אם צריך לערוך אותו — אפשר שאיצור עותק חדש בתיקיית העבודה."
             )
         service = _drive_service()
-        meta = service.files().get(fileId=file_id, fields="mimeType, name", supportsAllDrives=True).execute()
-        mime = meta.get("mimeType", "")
-        upload_mime = "text/csv" if mime == "application/vnd.google-apps.spreadsheet" else "text/plain"
-        media = MediaIoBaseUpload(
-            io.BytesIO((content or "").encode("utf-8")), mimetype=upload_mime, resumable=False
-        )
-        updated = service.files().update(
-            fileId=file_id, media_body=media, fields="id, name", supportsAllDrives=True
+        meta = service.files().get(
+            fileId=file_id,
+            fields="mimeType, name, permissions(emailAddress,role,type,domain,displayName)",
+            supportsAllDrives=True,
         ).execute()
-        return f"✅ הקובץ עודכן: {updated.get('name')} [id:{updated.get('id')}]"
+        refusal = _check_shared_edit(file_id, service, confirmed_shared_edit, meta)
+        if refusal:
+            return _refuse_write(refusal)
+        return _write_content(service, file_id, meta.get("mimeType", ""), content)
     except Exception as e:
         logger.error(f"update_drive_file failed for {file_id!r}: {e}")
         return f"❌ עדכון הקובץ נכשל: {e}"
+
+
+def _write_content(service, file_id: str, mime: str, content: str) -> str:
+    """The upload half of an edit, shared by update and append: everything
+    before this point - folder containment, the shared-file guard - is what
+    makes the write allowed."""
+    upload_mime = "text/csv" if mime == "application/vnd.google-apps.spreadsheet" else "text/plain"
+    media = MediaIoBaseUpload(
+        io.BytesIO((content or "").encode("utf-8")), mimetype=upload_mime, resumable=False
+    )
+    updated = service.files().update(
+        fileId=file_id, media_body=media, fields="id, name", supportsAllDrives=True
+    ).execute()
+    return f"✅ הקובץ עודכן: {updated.get('name')} [id:{updated.get('id')}]"
+
+
+def append_drive_file(file_id: str, content: str,
+                      confirmed_shared_edit: bool = False) -> str:
+    """Adds lines to the END of a file in the working folder, keeping what is
+    already there. Use it for logs and tracking tables - a VOC row in the
+    monthly sheet, a note at the end of a doc - where update_drive_file
+    would make you read and resend the whole file.
+
+    The same rules as update_drive_file: only inside the working folder, and
+    a file anyone besides Itai and the bot can see is never touched without
+    his explicit approval in the conversation (then confirmed_shared_edit=True).
+
+    Args:
+        file_id: The file's Drive id.
+        content: The text to add at the end (for a sheet, one CSV row).
+        confirmed_shared_edit: True only after Itai explicitly approved
+            editing this specific shared file in this conversation.
+
+    Returns:
+        Confirmation, or the reason the edit was refused.
+    """
+    file_id = (file_id or "").strip()
+    content = content or ""
+    if not file_id:
+        return _refuse_write("צריך מזהה קובץ.")
+    if not content.strip():
+        return _refuse_write("צריך תוכן להוספה.")
+    if not FOLDER_ID:
+        return _refuse_write("לא הוגדרה תיקיית עבודה בדרייב (DRIVE_FOLDER_ID), אז אין מה לערוך.")
+
+    logger.info(f"Drive tool: append_drive_file(file_id={file_id!r})")
+    try:
+        if FOLDER_ID not in _parents(file_id):
+            return _refuse_write(
+                "הקובץ הזה לא נמצא בתיקיית העבודה, ולכן אני יכול רק לקרוא אותו ולא לשנות אותו."
+            )
+        service = _drive_service()
+        meta = service.files().get(
+            fileId=file_id,
+            fields="mimeType, name, permissions(emailAddress,role,type,domain,displayName)",
+            supportsAllDrives=True,
+        ).execute()
+        refusal = _check_shared_edit(file_id, service, confirmed_shared_edit, meta)
+        if refusal:
+            return _refuse_write(refusal)
+        mime = meta.get("mimeType", "")
+        if mime == "application/vnd.google-apps.spreadsheet":
+            current = service.files().export(fileId=file_id, mimeType="text/csv").execute()
+        elif mime in GOOGLE_EXPORTS:
+            current = service.files().export(fileId=file_id, mimeType="text/plain").execute()
+        else:
+            current = service.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
+        if isinstance(current, bytes):
+            current = current.decode("utf-8")
+        combined = (current or "").rstrip("\n") + "\n" + content.rstrip("\n") + "\n"
+        return _write_content(service, file_id, mime, combined)
+    except Exception as e:
+        logger.error(f"append_drive_file failed for {file_id!r}: {e}")
+        return f"❌ הוספה לקובץ נכשלה: {e}"
 
 
 def save_to_drive_folder(file_id: str) -> str:
@@ -765,7 +1027,8 @@ def _file_shortcut(service, file_id: str) -> dict:
     ).execute()
 
 
-def trash_drive_file(file_id: str, permanent: bool = False) -> str:
+def trash_drive_file(file_id: str, permanent: bool = False,
+                     confirmed_shared_edit: bool = False) -> str:
     """Moves a file in Itai's Drive to the bin, or deletes it for good.
 
     The default puts the file in the Drive bin, where it stays recoverable for
@@ -777,9 +1040,16 @@ def trash_drive_file(file_id: str, permanent: bool = False) -> str:
     anything Itai owns anywhere in his Drive. A file somebody else owns cannot
     be binned by him at all, and Google's refusal is reported as it comes.
 
+    A file that anyone besides Itai and the bot can see is never binned or
+    deleted without his explicit approval in the conversation - the refusal
+    names who else can see it, and only his explicit yes to THIS file allows
+    calling again with confirmed_shared_edit=True.
+
     Args:
         file_id: The file's Drive id, as it comes back from search_drive.
         permanent: True to delete for good instead of binning. Ask first.
+        confirmed_shared_edit: True only after Itai explicitly approved
+            removing this specific shared file in this conversation.
 
     Returns:
         Confirmation naming the file, or the reason Google refused.
@@ -794,11 +1064,16 @@ def trash_drive_file(file_id: str, permanent: bool = False) -> str:
         # Read the name before acting: the confirmation has to say what actually
         # went, and after a permanent delete there is nothing left to ask.
         meta = service.files().get(
-            fileId=file_id, fields="name, ownedByMe, trashed", supportsAllDrives=True
+            fileId=file_id,
+            fields="name, ownedByMe, trashed, permissions(emailAddress,role,type,domain,displayName)",
+            supportsAllDrives=True,
         ).execute()
         name = meta.get("name", "(ללא שם)")
         if meta.get("trashed") and not permanent:
             return f"ℹ️ הקובץ {name!r} כבר נמצא בפח של הדרייב."
+        refusal = _check_shared_edit(file_id, service, confirmed_shared_edit, meta)
+        if refusal:
+            return _refuse_write(refusal)
         if permanent:
             service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
             return f"🗑️ {name!r} נמחק לצמיתות. אין דרך לשחזר אותו."

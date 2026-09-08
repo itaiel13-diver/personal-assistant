@@ -326,3 +326,64 @@ def test_an_incoming_message_reopens_the_free_window(client):
                     headers={"X-Hub-Signature-256": _sign(raw),
                              "Content-Type": "application/json"})
     note.assert_called_once_with("972500000000")
+
+
+# --- the owner allowlist ----------------------------------------------------
+#
+# The Meta signature proves a POST came from Meta, not who pressed send.
+# With OWNER_PHONE set, any other number must be dropped before it reaches
+# the assistant - and before note_inbound, or the next proactive message
+# would be aimed at the stranger.
+
+
+def _post_text(client, sender):
+    body = json.dumps(_text_message_payload(sender, "שלום")).encode()
+    return client.post(
+        "/webhook", data=body, content_type="application/json",
+        headers={"X-Hub-Signature-256": _sign(body)},
+    ), body
+
+
+def test_a_stranger_is_dropped_silently_when_owner_phone_is_set(client, monkeypatch):
+    monkeypatch.setattr(webhook_server, "OWNER_PHONE", "972548304072")
+    with patch("webhook_server.handle_whatsapp_message") as mock_handle, \
+         patch("webhook_server._send_whatsapp_reply") as mock_send, \
+         patch("webhook_server.storage.note_inbound") as mock_note:
+        r, _ = _post_text(client, "972500000001")
+    # Meta still gets its fast 2xx - the webhook must not look broken.
+    assert r.status_code == 200
+    mock_handle.assert_not_called()
+    mock_send.assert_not_called()
+    # The proactive side sends to the most recent inbound number, so a
+    # stranger's message must never be recorded as the last inbound.
+    mock_note.assert_not_called()
+
+
+def test_the_owner_gets_through(client, monkeypatch):
+    monkeypatch.setattr(webhook_server, "OWNER_PHONE", "972548304072")
+    with patch("webhook_server.handle_whatsapp_message", return_value="תשובה") as mock_handle, \
+         patch("webhook_server._send_whatsapp_reply"):
+        r, _ = _post_text(client, "972548304072")
+    assert r.status_code == 200
+    mock_handle.assert_called_once()
+
+
+def test_the_number_is_compared_on_digits_only(client, monkeypatch):
+    # An env var pasted out of a contacts app may carry a plus and spaces.
+    monkeypatch.setattr(webhook_server, "OWNER_PHONE", "+972 54-830-4072")
+    with patch("webhook_server.handle_whatsapp_message", return_value="תשובה") as mock_handle, \
+         patch("webhook_server._send_whatsapp_reply"):
+        r, _ = _post_text(client, "972548304072")
+    assert r.status_code == 200
+    mock_handle.assert_called_once()
+
+
+def test_without_owner_phone_the_gate_is_open(client, monkeypatch):
+    # Unset means nobody told us which number is Itai's - locking then would
+    # lock him out of his own assistant. This test pins that deliberate choice.
+    monkeypatch.setattr(webhook_server, "OWNER_PHONE", "")
+    with patch("webhook_server.handle_whatsapp_message", return_value="תשובה") as mock_handle, \
+         patch("webhook_server._send_whatsapp_reply"):
+        r, _ = _post_text(client, "972500000001")
+    assert r.status_code == 200
+    mock_handle.assert_called_once()

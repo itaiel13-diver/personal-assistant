@@ -32,6 +32,15 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v21.0")
 # button for making the assistant message Itai.
 TICK_SECRET = os.environ.get("TICK_SECRET", "")
 
+# The one person this assistant serves, in international form without a plus
+# (9725...). When set, messages from any other number are dropped before they
+# reach the assistant - see _is_owner for why the check lives here and why a
+# stranger gets silence rather than a polite refusal. Unset, every sender is
+# accepted: that is the fallback the proactive side already relies on (it
+# writes to whoever messaged last), and a lock whose key was never cut would
+# lock Itai out of his own assistant.
+OWNER_PHONE = os.environ.get("OWNER_PHONE", "").strip()
+
 
 def _is_valid_meta_signature(req) -> bool:
     """Confirms a webhook POST actually came from Meta, not a spoofed request.
@@ -117,6 +126,36 @@ def _send_whatsapp_reply(to: str, text: str) -> None:
     return bool(parts)
 
 
+def _normalise_number(value: str) -> str:
+    """Meta sends phone numbers as digits only; an env var pasted out of a
+    contacts app may carry a plus, spaces or dashes. Digits are the common
+    ground, so the comparison keeps only them."""
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def _is_owner(sender: str) -> bool:
+    """Whether this sender is the person the assistant exists for.
+
+    The Meta signature check proves the POST came from Meta. It says nothing
+    about who pressed send: anyone who messages the bot's business number
+    reaches this handler, and behind it sits an assistant that can read Itai's
+    mail, files, calendar and tasks. With OWNER_PHONE configured, every other
+    number is dropped here, before a single tool exists for them.
+
+    Dropped means silent, not a courteous "this bot is private". A reply
+    confirms to a stranger that the number is a live bot wired to someone's
+    accounts - exactly the reconnaissance the check is meant to deny - and a
+    wrong number already looks like silence, so silence costs nothing.
+
+    The check runs before note_inbound on purpose: the proactive side sends to
+    the most recent inbound number, so recording a stranger's message would
+    aim the next reminder at the stranger.
+    """
+    if not OWNER_PHONE:
+        return True
+    return _normalise_number(sender) == _normalise_number(OWNER_PHONE)
+
+
 def _extract_incoming_message(payload: dict):
     """Returns (sender, text, message_type, media) for the first message in a
     Meta webhook payload, or (None, None, None, None) for non-message events
@@ -173,6 +212,10 @@ def receive_webhook():
 
     payload = request.get_json(silent=True) or {}
     sender, text, message_type, media = _extract_incoming_message(payload)
+
+    if sender and not _is_owner(sender):
+        logger.warning(f"Message from a non-owner number ({sender}) - ignored.")
+        return "OK", 200
 
     if sender:
         # Itai writing is what reopens WhatsApp's 24-hour window, and the

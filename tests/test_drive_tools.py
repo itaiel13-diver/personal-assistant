@@ -568,3 +568,43 @@ def test_the_filing_tool_is_registered_and_the_prompt_knows_the_rule():
     assert assistant.save_to_drive_folder in assistant.tools_list
     assert "save_to_drive_folder" in assistant.SYSTEM_PROMPT
     assert "one folder, nowhere else" in assistant.SYSTEM_PROMPT
+
+
+# --- files shared with the bot itself -----------------------------------------
+
+def test_listing_bot_shares_asks_the_bot_identity_not_his_drive(monkeypatch):
+    """'What did I share with you?' is the bot's sharedWithMe set, asked of the
+    service account - never a listing of his Drive, which is how the bot once
+    answered with his whole library."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    files = _files(list={"files": [
+        {"id": "s1", "name": "מכירות שבוע 36", "mimeType": "application/vnd.google-apps.spreadsheet",
+         "modifiedTime": "2026-09-07T10:00:00Z", "owners": [{"displayName": "איתי"}]},
+    ]})
+    user_service = MagicMock()
+    with patch.object(drive_tools, "_sa_drive_service", return_value=_service(files)), \
+         patch.object(drive_tools, "_drive_service", return_value=user_service):
+        out = drive_tools.list_bot_shares()
+    assert files.list.call_args.kwargs["q"] == "sharedWithMe = true and trashed = false"
+    assert "מכירות שבוע 36" in out
+    user_service.files.assert_not_called()
+
+
+def test_listing_bot_shares_without_a_bot_identity_says_so(monkeypatch):
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+    out = drive_tools.list_bot_shares()
+    assert "GOOGLE_SERVICE_ACCOUNT_JSON" in out
+
+
+def test_an_empty_share_list_says_nothing_was_shared_and_with_whom(monkeypatch):
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    files = _files(list={"files": []})
+    with patch.object(drive_tools, "_sa_drive_service", return_value=_service(files)):
+        out = drive_tools.list_bot_shares()
+    assert "עוד לא שותף" in out and drive_tools._sa_email() in out
+
+
+def test_the_bot_shares_tool_is_registered_and_the_prompt_knows_the_rule():
+    import assistant
+    assert assistant.list_bot_shares in assistant.tools_list
+    assert "list_bot_shares" in assistant.SYSTEM_PROMPT

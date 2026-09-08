@@ -32,6 +32,7 @@ from calendar_tools import (
 )
 from drive_tools import (
     create_drive_file,
+    list_bot_shares,
     list_drive_folder,
     read_drive_file,
     save_to_drive_folder,
@@ -200,6 +201,10 @@ GOOGLE DRIVE:
   to is data loss he will not notice until later.
 - Say where you saved something and what it is called, every time. A file he cannot
   find is a file you did not create as far as he is concerned.
+- "What did I share with you?" is answered ONLY by list_bot_shares: files whose
+  sharing was addressed to the bot's own address. It is never answered by
+  listing or searching his Drive - those are his files, not shares to you.
+  "What did others share with ME?" is search_drive with shared_with_me_only.
 - When he wants a shared file KEPT - "save it", "add it to my files" - file it
   into the working folder with save_to_drive_folder. Everything the assistant
   makes or keeps lives in that one folder, nowhere else in his Drive.
@@ -410,6 +415,7 @@ tools_list = [
     list_drive_folder,
     read_drive_file,
     save_to_drive_folder,
+    list_bot_shares,
     create_drive_file,
     update_drive_file,
     trash_drive_file,
@@ -583,6 +589,22 @@ def _answer_without_gemini(incoming_text: str, sender_id: str) -> str | None:
 
 
 # 5. מנוע השיחה הראשי
+def _quota_dead_end_message() -> str:
+    """The message after Gemini's 429 AND every fallback provider said no.
+
+    The two cases need different fixes, so the message names which one
+    happened: no backup key configured means a Render variable is missing
+    (setup gap, fixable in two minutes); backups configured but refusing means
+    real exhaustion or a dead provider (e.g. a model id the vendor retired).
+    """
+    backups = [name for name in llm.available() if name != "gemini"]
+    if not backups:
+        return ("נגמרה מכסת ג'מיני היומית, ואין מודל גיבוי מוגדר - GROQ_API_KEY "
+                "או OPENROUTER_API_KEY לא מוגדרים ב-Render. המכסה מתאפסת מחר.")
+    return (f"נגמרה מכסת ג'מיני היומית, וגם מודלי הגיבוי ({', '.join(backups)}) "
+            "לא ענו. המכסה מתאפסת מחר, או שאפשר לשדרג את התוכנית.")
+
+
 def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> str:
     """
     Handles an incoming WhatsApp message from a given sender, restoring the
@@ -608,7 +630,7 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
             spare = _answer_without_gemini(incoming_text, sender_id)
             if spare:
                 return spare
-            return "נגמרה מכסת השימוש היומית ב-AI. היא מתאפסת מחר, או שאפשר לשדרג את התוכנית."
+            return _quota_dead_end_message()
         return "מצטער, יש תקלה בחיבור ל-AI. נסה/י שוב בעוד רגע."
     except Exception as e:
         logger.error(f"Gemini call failed for sender {sender_id}: {e}")

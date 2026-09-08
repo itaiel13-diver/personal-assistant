@@ -10,6 +10,7 @@ from google.genai import errors as genai_errors
 
 import storage
 import llm
+import reminders
 from gmail_tools import (
     create_email_draft,
     read_email,
@@ -176,16 +177,31 @@ ACTIVE LEARNING, NO-GUESSING & LONG-TERM MEMORY RULES:
    - When Itai answers a clarification question or gives a new rule/mapping, call `save_to_long_term_memory(key, value, category)` immediately to save it permanently.
 
 PROACTIVE ROUTINES (things you send Itai without being asked):
-Two of these run today, on a heartbeat that fires every half hour. They are
+Three of these run today, on a heartbeat that fires every half hour. They are
 sent by the system, not written by you, so do not claim to have sent one you
 did not - and do not promise a routine that is not on this list.
 - Shift sign-in/out (08:55 and 17:55, Sunday-Thursday): a Connecteam reminder.
   This is the highest-priority routine in the project.
+- Reminders: anything Itai asked you to remind him about goes out at the hour
+  he set, any day, any hour - including at night, because he chose the time.
+  You schedule these with create_reminder; the heartbeat delivers them.
 - New mail (07:00-22:30): one message per unread email in the primary inbox,
   with sender, subject and a preview. It ends with an [id:...] - when Itai
   answers it, use read_email with that id rather than searching the mailbox.
 Not built yet, so do not offer them as if they were: the morning briefing and
 the weekly bonus reminder.
+
+REMINDERS:
+Use create_reminder the moment Itai asks to be reminded of something - do not
+answer "I will remember" without calling it, because you have no memory between
+messages and nothing would actually fire. Pass his own words for the time
+("mahar ba'boker", "od sha'atayim", "kol yom rishon b-9:00") in `when`; the
+system parses them. If the tool answers that it could not understand the time,
+ask him for an exact hour instead of guessing. Read back the time the tool
+reports, not the time you assumed - if they differ, the tool is right.
+For a repeating reminder pass `repeat`: once, daily, weekdays (Sunday-Thursday),
+weekly or monthly. list_reminders shows what is armed; cancel_reminder takes an
+id from that list and cancels the whole series.
 
 COMMUNICATION STYLE:
 - Natural, sharp, highly structured Israeli business Hebrew.
@@ -238,6 +254,64 @@ def update_daily_schedule(store_name: str, status: str, notes: str) -> str:
     # כאן ייכנס הקוד הייעודי לעדכון שורה ב-Google Sheets
     return f"✅ עודכן בהצלחה בלו\"ז: ביקור ב-{store_name} מסומן כ-{status}."
 
+# --- reminders ---------------------------------------------------------
+#
+# These three are the only tools that write something the assistant will act on
+# later, on its own. Everything else it does is a read, or a write Itai sees
+# the result of immediately - a reminder is a promise to interrupt him at a
+# specific moment, which is why the confirmation always reads the stored time
+# back to him rather than repeating what he asked for. If the parse went wrong,
+# he finds out now instead of at the wrong hour tomorrow.
+
+REMINDER_SENDER = os.environ.get("OWNER_PHONE", "default")
+
+
+def create_reminder(text: str, when: str, repeat: str = "once") -> str:
+    """Schedules a WhatsApp reminder for Itai at a future time.
+
+    Args:
+        text: What to remind him about, in Hebrew, phrased as the reminder
+            itself ("לשלוח את הדוח לדנה"), not as a description of the request.
+        when: The time to send it. Give an ISO 8601 local Israel timestamp
+            whenever you can work one out from the current date and time, e.g.
+            "2026-09-09T09:00". A Hebrew phrase such as "מחר בבוקר" or
+            "עוד שעתיים" is also understood.
+        repeat: One of "once", "daily", "weekdays" (Sunday-Thursday), "weekly",
+            "monthly". Use "once" unless he actually asked for a repeat.
+    """
+    due_at = reminders.parse_when(when)
+    if due_at is None:
+        return "❌ לא הצלחתי להבין לאיזה זמן. תשאל אותו לאיזו שעה בדיוק."
+    recurrence = reminders.normalise_recurrence(repeat)
+    reminder_id = storage.add_reminder(REMINDER_SENDER, text, due_at, recurrence)
+    if reminder_id is None:
+        return "❌ לא הצלחתי לשמור את התזכורת. אל תבטיח לו שהיא נשמרה."
+    return f"✅ נשמרה תזכורת #{reminder_id} ל-{reminders.describe(due_at, recurrence)}: {text}"
+
+
+def list_reminders() -> str:
+    """Lists the reminders Itai has scheduled and not yet received."""
+    open_items = storage.open_reminders(REMINDER_SENDER)
+    if not open_items:
+        return "אין כרגע תזכורות פתוחות."
+    lines = [
+        f"#{item['id']} — {reminders.describe(item['due_at'], item['recurrence'])}: {item['text']}"
+        for item in open_items
+    ]
+    return "\n".join(lines)
+
+
+def cancel_reminder(reminder_id: int) -> str:
+    """Cancels a scheduled reminder by its id, including all future repeats of it.
+
+    Args:
+        reminder_id: The number shown next to the reminder by list_reminders.
+    """
+    if storage.cancel_reminder(int(reminder_id), REMINDER_SENDER):
+        return f"✅ תזכורת #{reminder_id} בוטלה."
+    return f"❌ לא נמצאה תזכורת פתוחה במספר #{reminder_id}."
+
+
 tools_list = [
     save_to_long_term_memory,
     get_itai_targets,
@@ -259,6 +333,9 @@ tools_list = [
     create_drive_file,
     update_drive_file,
     trash_drive_file,
+    create_reminder,
+    list_reminders,
+    cancel_reminder,
 ]
 
 

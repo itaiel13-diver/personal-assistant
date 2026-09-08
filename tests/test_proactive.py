@@ -41,6 +41,9 @@ class FakeLedger:
         self.claimed = set()
         self.released = []
         self.turns = []
+        self.reminders = []
+        self.unclaimed = []
+        self.rescheduled = []
         self.sender = sender
         if wrote_at is self._DEFAULT:
             wrote_at = now - timedelta(hours=1) if now else None
@@ -65,6 +68,29 @@ class FakeLedger:
     def append_model_turn(self, sender_id, text):
         self.turns.append((sender_id, text))
 
+    # The reminder rows behave like the real table: claiming one flips its
+    # status in the same breath as reading it, which is what stops two ticks
+    # delivering the same reminder.
+    def claim_due_reminders(self, now, limit=5):
+        ready = [r for r in self.reminders
+                 if r["status"] == "pending" and r["due_at"] <= now][:limit]
+        for row in ready:
+            row["status"] = "sent"
+        return [dict(r) for r in ready]
+
+    def unclaim_reminder(self, reminder_id):
+        self.unclaimed.append(reminder_id)
+        for row in self.reminders:
+            if row["id"] == reminder_id:
+                row["status"] = "pending"
+
+    def reschedule_reminder(self, reminder_id, next_due):
+        self.rescheduled.append((reminder_id, next_due))
+        for row in self.reminders:
+            if row["id"] == reminder_id:
+                row["due_at"] = next_due
+                row["status"] = "pending"
+
 
 class Outbox:
     def __init__(self, ok=True):
@@ -81,7 +107,8 @@ def ledger(monkeypatch):
     def install(now=None, **kwargs):
         fake = FakeLedger(now=now, **kwargs)
         for name in ("enabled", "claim", "release", "last_inbound",
-                     "append_model_turn"):
+                     "append_model_turn", "claim_due_reminders",
+                     "unclaim_reminder", "reschedule_reminder"):
             monkeypatch.setattr(proactive.storage, name, getattr(fake, name))
         return fake
     return install
@@ -394,3 +421,207 @@ def test_gmail_falling_over_does_not_stop_the_attendance_reminder(ledger, monkey
     out = Outbox()
     summary = proactive.run_tick(send=out, now=now)
     assert summary["sent"] == [f"attendance:in:{SUNDAY}"]
+
+
+# --- reminders ----------------------------------------------------------
+#
+# These are the messages Itai asked for by name, which makes them the ones he
+# notices most: a duplicate reads as a broken assistant, and a repeat that
+# stops repeating reads as one that forgot.
+
+def reminder(id=1, text="לשלוח את הדוח לדנה", due="09:00", day=SUNDAY,
+             recurrence="once", status="pending"):
+    return {"id": id, "sender_id": "972500000000", "text": text,
+            "due_at": at(day, due), "recurrence": recurrence, "status": status}
+
+
+def test_a_due_reminder_is_delivered(ledger):
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder())
+    out = Outbox()
+
+    summary = proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert len(out.sent) == 1
+    assert "לשלוח את הדוח לדנה" in out.sent[0][1]
+    assert len(summary["sent"]) == 1
+
+
+def test_a_reminder_that_is_not_due_yet_stays_quiet(ledger):
+    now = at(SUNDAY, "08:00")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(due="09:00"))
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert out.sent == []
+
+
+def test_a_reminder_is_never_delivered_twice(ledger):
+    """The claim and the read are one statement, so a second tick over the same
+    window finds nothing left to take."""
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder())
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    proactive.run_tick(out, now=now + timedelta(minutes=5), routines=(proactive.reminders,))
+    assert len(out.sent) == 1
+
+
+def test_a_late_reminder_says_which_minute_it_was_for(ledger):
+    """Ticks are irregular. Without the original time a late reminder is just
+    a confusing one."""
+    now = at(SUNDAY, "09:40")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(due="09:00"))
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert "09:00" in out.sent[0][1]
+
+
+def test_a_punctual_reminder_does_not_bother_quoting_the_time(ledger):
+    now = at(SUNDAY, "09:02")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(due="09:00"))
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert "נקבעה" not in out.sent[0][1]
+
+
+def test_a_daily_reminder_is_rearmed_for_tomorrow(ledger):
+    now = at(SUNDAY, "09:05")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(recurrence="daily"))
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert len(out.sent) == 1
+    assert fake.rescheduled == [(1, at("2026-09-07", "09:00"))]
+
+
+def test_a_one_off_reminder_is_not_rearmed(ledger):
+    now = at(SUNDAY, "09:05")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(recurrence="once"))
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert fake.rescheduled == []
+
+
+def test_a_repeat_is_only_rearmed_once_the_message_actually_went_out(ledger):
+    """Advancing a recurrence on a failed send would skip that occurrence
+    entirely - the one way a repeating reminder silently loses a day."""
+    now = at(SUNDAY, "09:05")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(recurrence="daily"))
+    out = Outbox(ok=False)
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert fake.rescheduled == []
+    assert fake.unclaimed == [1]
+
+
+def test_a_failed_send_leaves_the_reminder_pending_for_the_next_tick(ledger):
+    now = at(SUNDAY, "09:05")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder())
+
+    proactive.run_tick(Outbox(ok=False), now=now, routines=(proactive.reminders,))
+    assert fake.reminders[0]["status"] == "pending"
+
+    out = Outbox()
+    proactive.run_tick(out, now=now + timedelta(minutes=30), routines=(proactive.reminders,))
+    assert len(out.sent) == 1
+
+
+def test_a_reminder_held_by_a_shut_window_is_put_back_not_lost(ledger):
+    """Outside WhatsApp's 24-hour window nothing can be delivered. The reminder
+    has to survive that and go out when he next writes."""
+    now = at(SUNDAY, "09:05")
+    fake = ledger(now=now, wrote_at=now - timedelta(hours=30))
+    fake.reminders.append(reminder())
+    out = Outbox()
+
+    summary = proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert out.sent == []
+    assert summary["held"]
+    assert fake.reminders[0]["status"] == "pending"
+
+    fake.wrote_at = now
+    proactive.run_tick(out, now=now + timedelta(minutes=10), routines=(proactive.reminders,))
+    assert len(out.sent) == 1
+
+
+def test_a_backlog_is_spread_over_ticks_rather_than_dumped_at_once(ledger):
+    """An instance asleep over a weekend comes back to a pile. Fifteen messages
+    at once is not catching up."""
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    for i in range(1, 9):
+        fake.reminders.append(reminder(id=i, due="09:00", text=f"פריט {i}"))
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert len(out.sent) == proactive.REMINDERS_PER_TICK
+
+    proactive.run_tick(out, now=now + timedelta(minutes=30), routines=(proactive.reminders,))
+    assert len(out.sent) == 8
+
+
+def test_reminders_fire_at_night_because_he_asked_for_them(ledger):
+    """The mail watch is quiet at night because nobody asked for that mail.
+    None of that reasoning applies to a time he set himself."""
+    now = at(SUNDAY, "05:30")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(due="05:30"))
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert len(out.sent) == 1
+
+
+def test_reminders_fire_on_friday_when_the_shift_reminder_does_not(ledger):
+    now = at(FRIDAY, "09:05")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(day=FRIDAY))
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=proactive.ROUTINES)
+    assert len(out.sent) == 1
+    assert "תזכורת" in out.sent[0][1]
+
+
+def test_a_reminder_is_written_into_the_conversation(ledger):
+    """So that "טופל" a minute later lands on a model that can see what it
+    just said."""
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder())
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert len(fake.turns) == 1
+
+
+def test_a_broken_reschedule_does_not_lose_the_rest_of_the_queue(ledger):
+    """The message has already gone out by the time the bookkeeping runs.
+    Raising there would cost the reminders behind it."""
+    now = at(SUNDAY, "11:00")
+    fake = ledger(now=now)
+    fake.reminders.append(reminder(id=1, recurrence="daily", text="ראשון"))
+    fake.reminders.append(reminder(id=2, text="שני"))
+
+    def explode(reminder_id, next_due):
+        raise RuntimeError("database went away")
+
+    import proactive as p
+    p.storage.reschedule_reminder = explode
+    out = Outbox()
+
+    proactive.run_tick(out, now=now, routines=(proactive.reminders,))
+    assert len(out.sent) == 2

@@ -151,6 +151,25 @@ def _ensure_schema(conn) -> None:
         cur.execute(
             "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMPTZ"
         )
+        # A reminder Itai asked for out loud. status is what makes the delivery
+        # exactly-once: the heartbeat flips 'pending' to 'sent' in the same
+        # statement that selects the row, so two overlapping ticks cannot both
+        # win it. A repeating reminder is not a new row - it is this row moved
+        # forward and set back to pending, so cancelling it cancels the series.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id         SERIAL PRIMARY KEY,
+                sender_id  TEXT NOT NULL,
+                text       TEXT NOT NULL,
+                due_at     TIMESTAMPTZ NOT NULL,
+                recurrence TEXT NOT NULL DEFAULT 'once',
+                status     TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS reminders_due ON reminders (status, due_at)"
+        )
     conn.commit()
     _schema_ready = True
 
@@ -377,3 +396,156 @@ def append_user_turn(sender_id: str, text: str) -> None:
     history = load_history(sender_id)
     history.append({"role": "user", "parts": [{"text": text}]})
     save_history(sender_id, history)
+
+
+# --- reminders ----------------------------------------------------------
+#
+# Same failure posture as the rest of the proactive side: every one of these
+# swallows its errors, because they run inside the heartbeat. The one that does
+# not is add_reminder, which runs inside a conversation - there, silently
+# failing to save would have Itai believe he has a reminder that does not
+# exist, which is the worst outcome available.
+
+
+def add_reminder(sender_id: str, text: str, due_at, recurrence: str = "once") -> int | None:
+    """Stores one reminder and returns its id, or None if it could not be stored."""
+    if not enabled():
+        return None
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO reminders (sender_id, text, due_at, recurrence)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (sender_id, text, due_at, recurrence),
+                )
+                new_id = cur.fetchone()[0]
+            conn.commit()
+        return new_id
+    except Exception as e:
+        logger.error(f"Failed to store a reminder for {sender_id}: {e}")
+        return None
+
+
+def claim_due_reminders(now, limit: int = 5) -> list:
+    """Takes ownership of every reminder that has come due, and returns them.
+
+    Selecting and flipping the status in one statement is the whole guarantee.
+    Reading the due rows and updating them afterwards leaves a gap in which a
+    second tick reads the same rows, and the result is a reminder delivered
+    twice - which on WhatsApp reads as a broken assistant.
+
+    The limit is a burst guard: an instance asleep over a weekend can come back
+    to a pile of due reminders, and sending fifteen messages at once is not
+    catching up, it is spamming. The rest stay pending for the next tick.
+    """
+    if not enabled():
+        return []
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE reminders SET status = 'sent'
+                    WHERE id IN (
+                        SELECT id FROM reminders
+                        WHERE status = 'pending' AND due_at <= %s
+                        ORDER BY due_at
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id, sender_id, text, due_at, recurrence
+                    """,
+                    (now, limit),
+                )
+                rows = cur.fetchall()
+            conn.commit()
+        return [
+            {"id": r[0], "sender_id": r[1], "text": r[2], "due_at": r[3], "recurrence": r[4]}
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"Failed to claim due reminders: {e}")
+        return []
+
+
+def unclaim_reminder(reminder_id: int) -> None:
+    """Puts a claimed reminder back when its message never went out."""
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE reminders SET status = 'pending' WHERE id = %s", (reminder_id,)
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to unclaim reminder {reminder_id}: {e}")
+
+
+def reschedule_reminder(reminder_id: int, next_due) -> None:
+    """Moves a repeating reminder to its next occurrence and arms it again."""
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE reminders SET due_at = %s, status = 'pending' WHERE id = %s",
+                    (next_due, reminder_id),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to reschedule reminder {reminder_id}: {e}")
+
+
+def open_reminders(sender_id: str, limit: int = 20) -> list:
+    """Everything still waiting to fire, soonest first."""
+    if not enabled():
+        return []
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, text, due_at, recurrence FROM reminders
+                    WHERE sender_id = %s AND status = 'pending'
+                    ORDER BY due_at LIMIT %s
+                    """,
+                    (sender_id, limit),
+                )
+                rows = cur.fetchall()
+        return [{"id": r[0], "text": r[1], "due_at": r[2], "recurrence": r[3]} for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to list reminders for {sender_id}: {e}")
+        return []
+
+
+def cancel_reminder(reminder_id: int, sender_id: str) -> bool:
+    """Drops a reminder, series and all. Scoped to the sender so one person's
+    reminder id can never delete somebody else's row."""
+    if not enabled():
+        return False
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM reminders WHERE id = %s AND sender_id = %s",
+                    (reminder_id, sender_id),
+                )
+                removed = cur.rowcount == 1
+            conn.commit()
+        return removed
+    except Exception as e:
+        logger.error(f"Failed to cancel reminder {reminder_id}: {e}")
+        return False

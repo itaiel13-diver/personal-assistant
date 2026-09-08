@@ -72,11 +72,19 @@ class Due:
     mail watch claims a message id so it does not look at the same email on
     every tick, and by then the claim is already made. run_tick then skips the
     claim but still gives it back if the message does not go out.
+
+    on_sent and on_failed are for a routine whose bookkeeping lives somewhere
+    other than the proactive log. A reminder is claimed by flipping a row's
+    status, so putting it back is an UPDATE on that row rather than a delete
+    here, and a repeating one has to be moved to its next occurrence the moment
+    this one is delivered. Both are optional and take no arguments.
     """
     fingerprint: str
     kind: str
     text: str
     preclaimed: bool = False
+    on_sent: object = None
+    on_failed: object = None
 
 
 def _slot(now: datetime, at: time) -> datetime:
@@ -194,7 +202,54 @@ def new_mail(now: datetime) -> list:
     return due
 
 
-ROUTINES = (attendance, new_mail)
+# --- reminders ----------------------------------------------------------
+#
+# The one routine Itai drives directly: everything here was asked for out loud,
+# in a sentence like "תזכיר לי מחר בבוקר לשלוח את הדוח". Which makes it the
+# routine with the least room to be wrong - he is expecting this message, at
+# roughly this time, and both a miss and a duplicate are immediately obvious.
+#
+# There are no quiet hours. A reminder set for 06:00 means 06:00; the mail
+# watch stays quiet at night because nobody asked for that mail, and nothing
+# about that reasoning applies to something he scheduled himself.
+
+REMINDERS_PER_TICK = 5
+
+
+def _reminder_text(row: dict, now: datetime) -> str:
+    late = int((now - row["due_at"].astimezone(ISRAEL_TZ)).total_seconds() // 60)
+    stamp = row["due_at"].astimezone(ISRAEL_TZ).strftime("%H:%M")
+    # Ticks are irregular, so a reminder can arrive well after its minute.
+    # Saying which minute it was for is the difference between a late reminder
+    # and a confusing one.
+    when = f" (נקבעה ל-{stamp})" if late >= 10 else ""
+    return f"⏰ *תזכורת*{when}\n{row['text']}"
+
+
+def reminders(now: datetime) -> list:
+    """Everything Itai scheduled that has now come due."""
+    import reminders as reminder_rules
+
+    due = []
+    for row in storage.claim_due_reminders(now, limit=REMINDERS_PER_TICK):
+        # The row was claimed by the same statement that selected it, so this
+        # tick owns it outright - preclaimed, with its own undo.
+        nxt = reminder_rules.next_occurrence(
+            row["due_at"].astimezone(ISRAEL_TZ), row["recurrence"], now
+        )
+        reminder_id = row["id"]
+        due.append(Due(
+            f"reminder:{reminder_id}:{row['due_at'].isoformat()}",
+            "reminder",
+            _reminder_text(row, now),
+            preclaimed=True,
+            on_sent=(lambda i=reminder_id, n=nxt: storage.reschedule_reminder(i, n)) if nxt else None,
+            on_failed=lambda i=reminder_id: storage.unclaim_reminder(i),
+        ))
+    return due
+
+
+ROUTINES = (attendance, reminders, new_mail)
 
 
 # --- the tick ------------------------------------------------------------
@@ -229,6 +284,18 @@ def collect(now: datetime, routines=ROUTINES) -> list:
     return items
 
 
+def _run_hook(hook, fingerprint: str) -> None:
+    """A routine's own bookkeeping must never be able to take down the tick -
+    the message has already gone out by the time this runs, and raising here
+    would lose the rest of the queue over an accounting problem."""
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception as e:
+        logger.error(f"Bookkeeping for {fingerprint} failed: {e}")
+
+
 def _hold(items) -> list:
     """Nothing goes out this tick. Anything a routine claimed on its own has to
     go back, or an email claimed while the window was shut would be marked as
@@ -236,6 +303,7 @@ def _hold(items) -> list:
     for item in items:
         if item.preclaimed:
             storage.release(item.fingerprint)
+            _run_hook(item.on_failed, item.fingerprint)
     return [i.fingerprint for i in items]
 
 
@@ -284,10 +352,12 @@ def run_tick(send, now=None, routines=ROUTINES) -> dict:
             # the assistant has no memory of sending, and the reply to it
             # arrives as a non sequitur.
             storage.append_model_turn(number, item.text)
+            _run_hook(item.on_sent, item.fingerprint)
         else:
             # The message never left. Give the claim back so the next tick can
             # try again while the item is still inside its grace window.
             storage.release(item.fingerprint)
+            _run_hook(item.on_failed, item.fingerprint)
             summary["failed"].append(item.fingerprint)
 
     return summary

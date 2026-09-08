@@ -205,6 +205,13 @@ GOOGLE DRIVE:
   sharing was addressed to the bot's own address. It is never answered by
   listing or searching his Drive - those are his files, not shares to you.
   "What did others share with ME?" is search_drive with shared_with_me_only.
+  list_bot_shares shows every share, old and new, with the date each was
+  shared, and opens shared folders to show what is inside them. Never say
+  "nothing was shared today" when the listing simply shows nothing new since
+  the last share - say when the newest share happened.
+- Everything shared with the bot is also mirrored into the working folder
+  automatically (the file itself appears there too, not a copy), so that
+  folder is his one place in Drive to track what the bot can see.
 - When he wants a shared file KEPT - "save it", "add it to my files" - file it
   into the working folder with save_to_drive_folder. Everything the assistant
   makes or keeps lives in that one folder, nowhere else in his Drive.

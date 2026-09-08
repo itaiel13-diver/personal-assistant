@@ -139,10 +139,17 @@ def _drive_service():
 #
 # Why the calendar cannot feel this. A service-account key is an identity, not
 # a bundle of permissions: scopes are chosen per credentials object, and
-# calendar_tools keeps its own object with the calendar scope alone. This one
-# is a separate object with drive.readonly and nothing more - the module below
-# never passes it to create, update, delete or permissions. The calendar code
-# itself is untouched, and the two modules share nothing but the same env var.
+# calendar_tools keeps its own object with the calendar scope alone. The read
+# path here is a separate object with drive.readonly and nothing more. The
+# calendar code itself is untouched, and the two modules share nothing but the
+# same env var.
+#
+# The one exception to read-only: mirror_bot_shares adds the working folder as
+# an extra PARENT of a file already shared with the bot, so Itai can track
+# every share from that folder in his own Drive. That is a write, and
+# drive.readonly cannot do it, so a second credentials object exists with the
+# full drive scope - used by that function alone, for that call alone: never
+# an edit, never a copy, never permissions().
 #
 # One production caveat: the SA's Google Cloud project (gen-lang-client-0890389089)
 # must have the Google Drive API enabled, or every call on this path fails with
@@ -150,7 +157,13 @@ def _drive_service():
 # click - see docs/STATUS.md.
 SA_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
+# Widened for the single write described above. Kept as its own constant and
+# its own builder so the read path stays provably read-only, and so a test can
+# fail any code that reaches for this object from anywhere but the mirror.
+SA_WRITE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
 _sa_service = None
+_sa_write_service = None
 
 
 def _sa_email() -> str:
@@ -177,6 +190,21 @@ def _sa_drive_service():
         )
         _sa_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
     return _sa_service
+
+
+def _sa_write_drive_service():
+    """Drive as the bot itself, with the write scope. Exists for the mirror's
+    addParents call and nothing else - see the comment above SA_WRITE_SCOPES."""
+    global _sa_write_service
+    if _sa_write_service is None:
+        raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        if not raw:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(raw), scopes=SA_WRITE_SCOPES
+        )
+        _sa_write_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    return _sa_write_service
 
 
 def _is_missing(error) -> bool:
@@ -211,11 +239,14 @@ def _describe(item: dict) -> str:
     owners = item.get("owners") or []
     owner = (owners[0].get("displayName") or owners[0].get("emailAddress")) if owners else ""
     modified = (item.get("modifiedTime") or "")[:10]
+    shared_time = (item.get("sharedWithMeTime") or "")[:10]
     line = f"{kind}: {item.get('name', '(ללא שם)')} [id:{item.get('id', '')}]"
     if owner:
         line += f" | בעלים: {owner}"
     if modified:
         line += f" | עודכן: {modified}"
+    if shared_time:
+        line += f" | שותף ב: {shared_time}"
     if item.get("shared") and not item.get("ownedByMe", True):
         line += " | משותף איתך"
     return line
@@ -326,8 +357,104 @@ def list_drive_folder() -> str:
         return f"❌ קריאת התיקייה נכשלה: {e}"
 
 
+BOT_SHARES_PAGE = 100
+BOT_SHARES_CAP = 200
+FOLDER_CHILDREN_CAP = 20
+
+
+def _all_bot_shares(service) -> list:
+    """Every item in the bot's sharedWithMe set, not just the first page.
+
+    The first version of this listing took one page of 15, ordered by last
+    modification - so a share of a file nobody had edited lately could fall
+    off the end, and the bot would swear nothing older was ever shared.
+    Shares are few and each one matters, so the listing walks every page."""
+    items = []
+    token = None
+    while len(items) < BOT_SHARES_CAP:
+        result = service.files().list(
+            q="sharedWithMe = true and trashed = false",
+            pageSize=BOT_SHARES_PAGE,
+            pageToken=token,
+            orderBy="modifiedTime desc",
+            fields="nextPageToken, files(id, name, mimeType, modifiedTime, sharedWithMeTime, "
+                   "parents, owners(displayName, emailAddress), shared, ownedByMe)",
+        ).execute()
+        items.extend(result.get("files", []))
+        token = result.get("nextPageToken")
+        if not token:
+            break
+    return items
+
+
+def _shared_folder_contents(service, folder: dict) -> list:
+    """The immediate children of a folder shared with the bot, so 'what did I
+    share with you' sees into shares made by folder and not only file by file.
+    The bot can list them because a folder share extends to everything inside
+    it - but those children are not themselves in its sharedWithMe set."""
+    try:
+        result = service.files().list(
+            q=f"'{_escape(folder['id'])}' in parents and trashed = false",
+            pageSize=FOLDER_CHILDREN_CAP + 1,
+            orderBy="modifiedTime desc",
+            fields="files(id, name, mimeType, modifiedTime, owners(displayName, emailAddress))",
+        ).execute()
+    except Exception as e:
+        logger.error(f"Listing shared folder {folder.get('id')} failed: {e}")
+        return [f"(לא הצלחתי לקרוא את תוכן התיקייה: {e})"]
+    children = result.get("files", [])
+    if not children:
+        return ["(התיקייה ריקה)"]
+    lines = [_describe(c) for c in children[:FOLDER_CHILDREN_CAP]]
+    if len(children) > FOLDER_CHILDREN_CAP:
+        lines.append(f"(מוצגים {FOLDER_CHILDREN_CAP} הראשונים)")
+    return lines
+
+
+def mirror_bot_shares(items: list | None = None) -> dict:
+    """Adds the working folder as an extra parent of every file shared with the bot.
+
+    Itai tracks what the bot can see by opening the working folder in his own
+    Drive, and a share that never lands there is invisible to that check. This
+    is the one write the bot's own identity may make: not a copy, not a
+    shortcut, not an edit - the file itself gains a second parent, so his
+    edits keep showing through, and revoking the share still cuts the bot off.
+    Folders are left alone: mirroring a shared folder would drag its whole
+    tree into the working folder, and what he asked to track is files.
+
+    Runs best-effort: a file shared as view-only cannot be re-parented (Google
+    answers 403) and is counted, not retried and not raised.
+    """
+    stats = {"added": [], "already": 0, "failed": []}
+    if not FOLDER_ID or not _sa_email():
+        return stats
+    if items is None:
+        items = _all_bot_shares(_sa_drive_service())
+    write_service = None
+    for item in items:
+        if item.get("mimeType") == FOLDER_MIME or item.get("id") == FOLDER_ID:
+            continue
+        if FOLDER_ID in (item.get("parents") or []):
+            stats["already"] += 1
+            continue
+        if write_service is None:
+            write_service = _sa_write_drive_service()
+        try:
+            write_service.files().update(
+                fileId=item["id"],
+                addParents=FOLDER_ID,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            stats["added"].append(item.get("name", item["id"]))
+        except Exception as e:
+            logger.warning(f"Could not mirror {item.get('id')} into the working folder: {e}")
+            stats["failed"].append(item.get("name", item["id"]))
+    return stats
+
+
 def list_bot_shares() -> str:
-    """Lists the files that were shared directly with the bot's own address.
+    """Lists everything that was ever shared directly with the bot's own address.
 
     "What did I share with you?" means exactly these - files whose sharing was
     addressed to the bot (the calendar-bot service account), not everything in
@@ -335,8 +462,16 @@ def list_bot_shares() -> str:
     account's sharedWithMe set is that list: Drive records every share to it
     even before the file is first opened.
 
+    The listing walks every page, so old shares show alongside new ones, each
+    with the date it was shared. A shared FOLDER is listed with its contents,
+    because files inside it do not appear in sharedWithMe on their own. And
+    every shared file is mirrored into the bot's working folder (the file
+    itself gains that folder as an extra parent - no copy), so the folder in
+    his Drive always reflects everything the bot can see.
+
     Returns:
-        The shared files with their ids, or a note that nothing was shared yet.
+        The shared files with their ids and share dates, or a note that
+        nothing was shared yet.
     """
     logger.info("Drive tool: list_bot_shares()")
     sa = _sa_email()
@@ -344,22 +479,44 @@ def list_bot_shares() -> str:
         return ("אין לבוט כתובת מוגדרת (GOOGLE_SERVICE_ACCOUNT_JSON), "
                 "אז אי אפשר לבדוק מה שותף איתו.")
     try:
-        result = _sa_drive_service().files().list(
-            q="sharedWithMe = true and trashed = false",
-            pageSize=MAX_RESULTS,
-            orderBy="modifiedTime desc",
-            fields="files(id, name, mimeType, modifiedTime, owners(displayName, emailAddress), shared, ownedByMe)",
-        ).execute()
+        service = _sa_drive_service()
+        items = _all_bot_shares(service)
     except Exception as e:
         logger.error(f"list_bot_shares failed: {e}")
         return f"❌ בדיקת השיתופים עם הבוט נכשלה: {e}"
-    files = result.get("files", [])
-    if not files:
+    if not items:
         return f"עוד לא שותף אף קובץ עם הבוט ({sa})."
-    lines = [_describe(f) for f in files]
+
+    try:
+        mirror = mirror_bot_shares(items)
+    except Exception as e:
+        # The mirror is a convenience over the listing, never a reason to
+        # withhold the answer itself.
+        logger.error(f"Mirroring bot shares failed: {e}")
+        mirror = {"added": [], "already": 0, "failed": []}
+
+    lines = []
+    for item in items:
+        lines.append(_describe(item))
+        if item.get("mimeType") != FOLDER_MIME:
+            continue
+        if item.get("id") == FOLDER_ID:
+            # He shares the working folder itself so the bot can write there.
+            # Listing its contents as 'shared with the bot' would be noise.
+            lines.append("  ↳ זו תיקיית העבודה של הבוט - כל קובץ שמשותף איתו מופיע בה אוטומטית.")
+        else:
+            lines.extend("  ↳ " + line for line in _shared_folder_contents(service, item))
     out = "\n".join(lines)
     if len(out) > MAX_LISTING_CHARS:
         out = out[:MAX_LISTING_CHARS].rsplit("\n", 1)[0] + "\n[הרשימה קוצרה]"
+
+    files_count = sum(1 for i in items if i.get("mimeType") != FOLDER_MIME)
+    if files_count:
+        if mirror["failed"]:
+            out += (f"\n⚠️ {len(mirror['failed'])} קבצים לא הצלחתי לשקף לתיקיית העבודה "
+                    "(כנראה שותפו לצפייה בלבד - צריך 'עריכה' כדי שהם יופיעו שם).")
+        else:
+            out += "\nהקבצים האלה מופיעים גם בתיקיית העבודה של הבוט בדרייב - אפשר לעקוב שם אחרי כל מה ששותף איתו."
     return out
 
 

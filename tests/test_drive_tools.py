@@ -608,3 +608,207 @@ def test_the_bot_shares_tool_is_registered_and_the_prompt_knows_the_rule():
     import assistant
     assert assistant.list_bot_shares in assistant.tools_list
     assert "list_bot_shares" in assistant.SYSTEM_PROMPT
+
+
+# --- mirroring bot shares into the working folder ---------------------------
+
+def test_mirror_adds_the_working_folder_as_a_parent_to_each_shared_file(monkeypatch):
+    """Option two, as Itai chose it: the same file in two places, never a copy -
+    so his edits keep showing through and revoking the share still cuts the bot
+    off. A file already there, a shared folder, and the working folder itself
+    are all left alone."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    write = _files(update={"id": "f1"})
+    items = [
+        {"id": "f1", "name": "דוח שבועי", "mimeType": "application/vnd.google-apps.document",
+         "parents": ["his-root"]},
+        {"id": "f2", "name": "מצגת", "mimeType": "application/vnd.google-apps.presentation",
+         "parents": [FOLDER]},
+        {"id": "fold", "name": "תיקייה משותפת", "mimeType": drive_tools.FOLDER_MIME,
+         "parents": ["his-root"]},
+        {"id": FOLDER, "name": "תיקיית הבוט", "mimeType": drive_tools.FOLDER_MIME, "parents": []},
+    ]
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_sa_write_drive_service", return_value=_service(write)):
+        stats = drive_tools.mirror_bot_shares(items)
+    write.update.assert_called_once()
+    kwargs = write.update.call_args.kwargs
+    assert kwargs["fileId"] == "f1"
+    assert kwargs["addParents"] == FOLDER
+    assert kwargs["supportsAllDrives"] is True
+    assert stats["added"] == ["דוח שבועי"]
+    assert stats["already"] == 1
+    assert stats["failed"] == []
+
+
+def test_a_share_that_cannot_be_reparented_is_counted_not_raised(monkeypatch):
+    """A file shared as view-only cannot gain a parent - Google answers 403.
+    The mirror is bookkeeping: one refusal must not stop the rest, and must
+    never take down the listing that called it."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    write = MagicMock()
+    write.update.return_value.execute.side_effect = _missing(403)
+    items = [
+        {"id": "v1", "name": "לצפייה בלבד", "mimeType": "text/plain", "parents": []},
+        {"id": "v2", "name": "גם זה", "mimeType": "text/plain", "parents": []},
+    ]
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_sa_write_drive_service", return_value=_service(write)):
+        stats = drive_tools.mirror_bot_shares(items)
+    assert write.update.call_count == 2
+    assert stats["failed"] == ["לצפייה בלבד", "גם זה"]
+    assert stats["added"] == []
+
+
+def test_mirror_without_a_working_folder_or_a_bot_identity_does_nothing(monkeypatch):
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    with patch.object(drive_tools, "FOLDER_ID", ""):
+        stats = drive_tools.mirror_bot_shares([{"id": "f1", "mimeType": "text/plain"}])
+    assert stats == {"added": [], "already": 0, "failed": []}
+
+
+def test_the_write_scope_is_used_only_by_the_mirror():
+    """The bot's identity may write in exactly one way: adding the working
+    folder as a parent of a file already shared with it. The wider scope
+    exists for that call alone, so any other function reaching for the write
+    service fails this test."""
+    assert drive_tools.SA_WRITE_SCOPES == ["https://www.googleapis.com/auth/drive"]
+    users = set()
+    for node in ast.walk(_tree()):
+        if isinstance(node, ast.FunctionDef):
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) \
+                        and inner.func.id == "_sa_write_drive_service":
+                    users.add(node.name)
+    assert users == {"mirror_bot_shares"}, f"the write identity leaked into {users}"
+
+
+def test_the_mirror_write_only_reparents_never_edits():
+    """addParents changes where a file shows up, not what is inside it. A
+    mirror update carrying a body or media would be an edit wearing the
+    mirror's clothes."""
+    found = False
+    for node in ast.walk(_tree()):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "update" \
+                and any(kw.arg == "addParents" for kw in node.keywords):
+            found = True
+            keywords = {kw.arg for kw in node.keywords}
+            assert "body" not in keywords and "media_body" not in keywords
+    assert found, "the mirror's addParents update is gone"
+
+
+# --- the reworked listing ----------------------------------------------------
+
+def test_listing_bot_shares_walks_every_page_so_old_shares_are_not_cut_off(monkeypatch):
+    """The listing used to stop after one page of 15, ordered by last edit -
+    a share of a file nobody had edited lately fell off the end and the bot
+    reported it as never shared. It walks every page now, and says WHEN each
+    share happened so 'only new ones show' cannot be claimed again."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    files = MagicMock()
+    files.list.return_value.execute.side_effect = [
+        {"files": [
+            {"id": "n1", "name": "קובץ חדש", "mimeType": "text/plain",
+             "modifiedTime": "2026-09-08T10:00:00Z", "sharedWithMeTime": "2026-09-08T10:05:00Z",
+             "parents": [FOLDER]},
+        ], "nextPageToken": "p2"},
+        {"files": [
+            {"id": "o1", "name": "מסמך ישן", "mimeType": "text/plain",
+             "modifiedTime": "2026-01-01T10:00:00Z", "sharedWithMeTime": "2026-09-01T09:00:00Z",
+             "parents": [FOLDER]},
+        ]},
+    ]
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(files)), \
+         patch.object(drive_tools, "_sa_write_drive_service", return_value=_service(MagicMock())):
+        out = drive_tools.list_bot_shares()
+    assert files.list.call_count == 2
+    assert files.list.call_args_list[1].kwargs["pageToken"] == "p2"
+    assert "מסמך ישן" in out
+    assert "שותף ב: 2026-09-01" in out
+
+
+def test_a_shared_folder_is_listed_with_its_contents(monkeypatch):
+    """Files inside a shared folder are not in the bot's sharedWithMe set -
+    the folder share extends to them without naming them. 'What did I share
+    with you' has to open the folder, or a folder-share looks invisible."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    files = MagicMock()
+    files.list.return_value.execute.side_effect = [
+        {"files": [
+            {"id": "shared-fold", "name": "חומרי סניף", "mimeType": drive_tools.FOLDER_MIME,
+             "modifiedTime": "2026-09-07T10:00:00Z", "sharedWithMeTime": "2026-09-07T10:00:00Z",
+             "parents": []},
+        ]},
+        {"files": [
+            {"id": "in1", "name": "מחירון", "mimeType": "text/plain",
+             "modifiedTime": "2026-09-07T11:00:00Z"},
+        ]},
+    ]
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(files)), \
+         patch.object(drive_tools, "_sa_write_drive_service", return_value=_service(MagicMock())):
+        out = drive_tools.list_bot_shares()
+    assert "חומרי סניף" in out and "מחירון" in out
+    assert "'shared-fold' in parents" in files.list.call_args_list[1].kwargs["q"]
+
+
+def test_the_working_folder_itself_is_neither_expanded_nor_mirrored(monkeypatch):
+    """He shares the working folder with the bot so the bot can write there.
+    Listing its contents as 'shared with the bot' would be noise, and adding
+    it as its own parent is a cycle Drive rejects."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    files = _files(list={"files": [
+        {"id": FOLDER, "name": "תיקיית הבוט", "mimeType": drive_tools.FOLDER_MIME,
+         "modifiedTime": "2026-09-07T10:00:00Z", "parents": []},
+    ]})
+    write = _files(update={"id": "x"})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(files)), \
+         patch.object(drive_tools, "_sa_write_drive_service", return_value=_service(write)):
+        out = drive_tools.list_bot_shares()
+    assert files.list.call_count == 1, "the working folder's contents were listed as shares"
+    write.update.assert_not_called()
+    assert "תיקיית העבודה של הבוט" in out
+
+
+def test_a_clean_listing_says_the_files_also_show_in_the_working_folder(monkeypatch):
+    """The tracking he asked for: the answer itself points at the one place
+    in his Drive that always reflects what the bot can see."""
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    files = _files(list={"files": [
+        {"id": "s1", "name": "מכירות שבוע 36", "mimeType": "application/vnd.google-apps.spreadsheet",
+         "modifiedTime": "2026-09-07T10:00:00Z", "parents": [FOLDER]},
+    ]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(files)), \
+         patch.object(drive_tools, "_sa_write_drive_service", return_value=_service(MagicMock())):
+        out = drive_tools.list_bot_shares()
+    assert "מכירות שבוע 36" in out
+    assert "תיקיית העבודה" in out
+
+
+def test_a_failed_mirror_is_reported_without_hiding_the_listing(monkeypatch):
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    files = _files(list={"files": [
+        {"id": "s1", "name": "מסמך לצפייה", "mimeType": "text/plain",
+         "modifiedTime": "2026-09-07T10:00:00Z", "parents": []},
+    ]})
+    write = MagicMock()
+    write.update.return_value.execute.side_effect = _missing(403)
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER), \
+         patch.object(drive_tools, "_sa_drive_service", return_value=_service(files)), \
+         patch.object(drive_tools, "_sa_write_drive_service", return_value=_service(write)):
+        out = drive_tools.list_bot_shares()
+    assert "מסמך לצפייה" in out
+    assert "צפייה בלבד" in out
+
+
+def test_the_prompt_knows_shares_are_mirrored_and_dated():
+    """The model cannot relay what it was never told: the answer rules must
+    say that shares are mirrored into the working folder and that the listing
+    covers old shares too, or 'nothing new today' comes back."""
+    import assistant
+    assert "mirrored into the working folder" in assistant.SYSTEM_PROMPT
+    assert "every share, old and new" in assistant.SYSTEM_PROMPT

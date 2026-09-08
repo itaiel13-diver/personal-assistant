@@ -435,7 +435,26 @@ def daily_question(now: datetime) -> list:
     )]
 
 
-ROUTINES = (attendance, reminders, unanswered_mail, new_mail, daily_question)
+def shared_files_mirror(now: datetime) -> list:
+    """Keeps the working folder a live mirror of everything shared with the bot.
+
+    Itai tracks what the bot can see by opening that folder in his own Drive,
+    and a share he makes and never asks about would otherwise stay invisible
+    there until somebody ran list_bot_shares. This sends nothing - the mirror
+    is bookkeeping, not a message - so it always returns an empty list."""
+    import drive_tools
+
+    stats = drive_tools.mirror_bot_shares()
+    if stats["added"] or stats["failed"]:
+        logger.info(
+            f"Drive mirror: {len(stats['added'])} shared files added to the "
+            f"working folder, {len(stats['failed'])} could not be mirrored."
+        )
+    return []
+
+
+ROUTINES = (attendance, reminders, unanswered_mail, new_mail, daily_question,
+            shared_files_mirror)
 
 
 # --- the tick ------------------------------------------------------------

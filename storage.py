@@ -181,6 +181,19 @@ def _ensure_schema(conn) -> None:
         # assistant._load_memory_context - a credential there would be shown to
         # the model, and through it to whoever is talking to the model, on every
         # turn. Nothing secret goes in that table, ever.
+        # The investment portfolio Itai handed over once (the holdings export
+        # from his broker, forwarded on WhatsApp). One row, one JSON document:
+        # the evening summary prices it every day, and a newer export replaces
+        # it whole. Deliberately NOT the memory table - holdings are data a
+        # routine reads, not facts to render into every prompt.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                holdings    JSONB NOT NULL,
+                source      TEXT NOT NULL DEFAULT '',
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS oauth_tokens (
                 provider      TEXT PRIMARY KEY,
@@ -262,6 +275,52 @@ def save_memory(key: str, value: str, category: str = "general") -> None:
     except Exception as e:
         logger.error(f"Failed to save memory item {key}: {e}")
         raise
+
+
+def load_portfolio() -> list:
+    """The stored holdings as a list of dicts, [] when none was ever saved."""
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT holdings FROM portfolio WHERE id = 1")
+                row = cur.fetchone()
+        if not row:
+            return []
+        holdings = row[0]
+        return holdings if isinstance(holdings, list) else []
+    except Exception as e:
+        logger.error(f"Failed to load portfolio: {e}")
+        return []
+
+
+def save_portfolio(holdings: list, source: str = "") -> bool:
+    """Replaces the stored portfolio with a fresh export. False when no
+    database is configured - the caller then says it could not keep it."""
+    if not enabled():
+        logger.error("save_portfolio called without a database")
+        return False
+    import json as _json
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO portfolio (id, holdings, source, updated_at)
+                    VALUES (1, %s::jsonb, %s, now())
+                    ON CONFLICT (id)
+                    DO UPDATE SET holdings = EXCLUDED.holdings,
+                                  source = EXCLUDED.source,
+                                  updated_at = now()
+                    """,
+                    (_json.dumps(holdings, ensure_ascii=False), source or ""),
+                )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save portfolio: {e}")
+        return False
 
 
 # --- rotating OAuth refresh tokens --------------------------------------

@@ -53,12 +53,14 @@ def test_deleting_a_file_means_the_bin_unless_asked_otherwise():
 
     files = _files(
         get={"name": "דוח ספטמבר", "ownedByMe": True, "trashed": False,
+             "parents": [FOLDER],
              "permissions": [{"type": "user", "role": "owner",
                               "emailAddress": "itaiel13@gmail.com"}]},
         update={"id": "f1"},
     )
-    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
-        out = drive_tools.trash_drive_file("f1")
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.trash_drive_file("f1")
 
     files.delete.assert_not_called()
     assert files.update.call_args.kwargs["body"] == {"trashed": True}
@@ -70,10 +72,12 @@ def test_a_permanent_delete_happens_only_when_it_is_asked_for():
     when asked - a 'permanent' flag that quietly still bins would be worse than
     no flag - and must say plainly that nothing can be recovered."""
     files = _files(get={"name": "טיוטה ישנה", "ownedByMe": True, "trashed": False,
+                        "parents": [FOLDER],
                         "permissions": [{"type": "user", "role": "owner",
                                          "emailAddress": "itaiel13@gmail.com"}]})
-    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
-        out = drive_tools.trash_drive_file("f9", permanent=True)
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.trash_drive_file("f9", permanent=True)
 
     files.delete.assert_called_once()
     assert files.delete.call_args.kwargs["fileId"] == "f9"
@@ -84,9 +88,11 @@ def test_a_permanent_delete_happens_only_when_it_is_asked_for():
 def test_binning_something_already_in_the_bin_does_not_call_google_again():
     """Cheap, but it is the difference between a truthful answer and a second
     confirmation that implies work happened twice."""
-    files = _files(get={"name": "כבר בפח", "ownedByMe": True, "trashed": True})
-    with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
-        out = drive_tools.trash_drive_file("f2")
+    files = _files(get={"name": "כבר בפח", "ownedByMe": True, "trashed": True,
+                        "parents": [FOLDER]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.trash_drive_file("f2")
 
     files.update.assert_not_called()
     files.delete.assert_not_called()
@@ -377,12 +383,12 @@ def test_a_file_outside_the_working_folder_is_read_only():
 
 def test_a_file_inside_the_working_folder_can_be_edited():
     files = MagicMock()
-    files.get.return_value.execute.side_effect = [
-        {"parents": [FOLDER]},
-        {"mimeType": "application/vnd.google-apps.document", "name": "סיכום",
-         "permissions": [{"type": "user", "role": "owner",
-                          "emailAddress": "itaiel13@gmail.com"}]},
-    ]
+    files.get.return_value.execute.return_value = {
+        "mimeType": "application/vnd.google-apps.document", "name": "סיכום",
+        "parents": [FOLDER],
+        "permissions": [{"type": "user", "role": "owner",
+                         "emailAddress": "itaiel13@gmail.com"}],
+    }
     files.update.return_value.execute.return_value = {"id": "mine", "name": "סיכום"}
     with patch.object(drive_tools, "FOLDER_ID", FOLDER):
         with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
@@ -676,11 +682,12 @@ def test_mirror_without_a_working_folder_or_a_bot_identity_does_nothing(monkeypa
     assert stats == {"added": [], "already": 0, "failed": []}
 
 
-def test_the_write_scope_is_used_only_by_the_mirror():
-    """The bot's identity may write in exactly one way: adding the working
-    folder as a parent of a file already shared with it. The wider scope
-    exists for that call alone, so any other function reaching for the write
-    service fails this test."""
+def test_the_write_scope_is_used_only_by_the_mirror_and_tree_mutations():
+    """The bot's identity may write in exactly two ways: the mirror adding
+    the working folder as a parent of a file already shared with it, and
+    _mutation_identity taking over a change every caller then confines to
+    the working folder tree - Itai's unlimited-permissions rule (2026-09-08)
+    covers the tree and only the tree. Any other reach fails this test."""
     assert drive_tools.SA_WRITE_SCOPES == ["https://www.googleapis.com/auth/drive"]
     users = set()
     for node in ast.walk(_tree()):
@@ -689,7 +696,8 @@ def test_the_write_scope_is_used_only_by_the_mirror():
                 if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) \
                         and inner.func.id == "_sa_write_drive_service":
                     users.add(node.name)
-    assert users == {"mirror_bot_shares"}, f"the write identity leaked into {users}"
+    assert users == {"mirror_bot_shares", "_mutation_identity"}, (
+        f"the write identity leaked into {users}")
 
 
 def test_the_mirror_write_only_reparents_never_edits():
@@ -835,9 +843,11 @@ SA_JSON = '{"client_email": "calendar-bot@proj.iam.gserviceaccount.com"}'
 
 def _editing_files(meta):
     """A files() resource answering the update_drive_file call sequence:
-    parents check, then the metadata+permissions read."""
+    one metadata read (which also carries the parents the tree check reads),
+    then the write."""
     files = MagicMock()
-    files.get.return_value.execute.side_effect = [{"parents": [FOLDER]}, meta]
+    meta = {**meta, "parents": meta.get("parents", [FOLDER])}
+    files.get.return_value.execute.return_value = meta
     files.update.return_value.execute.return_value = {"id": "f1", "name": meta.get("name", "f")}
     return files
 
@@ -912,6 +922,7 @@ def test_an_unreadable_sharing_state_refuses_instead_of_guessing():
 
 def test_binning_a_shared_file_needs_the_same_approval():
     files = _files(get={"name": "משותף", "ownedByMe": False, "trashed": False,
+                        "parents": [FOLDER],
                         "permissions": [OWNER_PERM, OUTSIDER_PERM]})
     with patch.object(drive_tools, "FOLDER_ID", FOLDER):
         with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
@@ -931,7 +942,8 @@ def test_every_content_write_passes_the_shared_edit_guard():
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
             writers[node.name] = ast.dump(node)
-    for name in ("update_drive_file", "append_drive_file", "trash_drive_file"):
+    for name in ("update_drive_file", "append_drive_file", "trash_drive_file",
+                 "rename_drive_file", "move_drive_file"):
         assert "_check_shared_edit" in writers.get(name, ""), (
             f"{name} writes without passing the shared-edit guard"
         )
@@ -988,11 +1000,10 @@ def test_a_folder_outside_the_working_tree_is_refused():
 
 def test_append_keeps_the_existing_content_and_adds_to_the_end():
     files = MagicMock()
-    files.get.return_value.execute.side_effect = [
-        {"parents": [FOLDER]},
-        {"mimeType": "application/vnd.google-apps.spreadsheet", "name": "VOC",
-         "permissions": [OWNER_PERM]},
-    ]
+    files.get.return_value.execute.return_value = {
+        "mimeType": "application/vnd.google-apps.spreadsheet", "name": "VOC",
+        "parents": [FOLDER], "permissions": [OWNER_PERM],
+    }
     files.export.return_value.execute.return_value = "תאריך,נושא\n08/09,ביקור ראשון\n"
     files.update.return_value.execute.return_value = {"id": "f1", "name": "VOC"}
     with patch.object(drive_tools, "FOLDER_ID", FOLDER):
@@ -1004,14 +1015,161 @@ def test_append_keeps_the_existing_content_and_adds_to_the_end():
 
 def test_append_to_a_shared_file_is_guarded_too():
     files = MagicMock()
-    files.get.return_value.execute.side_effect = [
-        {"parents": [FOLDER]},
-        {"mimeType": "application/vnd.google-apps.document", "name": "משותף",
-         "permissions": [OWNER_PERM, OUTSIDER_PERM]},
-    ]
+    files.get.return_value.execute.return_value = {
+        "mimeType": "application/vnd.google-apps.document", "name": "משותף",
+        "parents": [FOLDER], "permissions": [OWNER_PERM, OUTSIDER_PERM],
+    }
     with patch.object(drive_tools, "FOLDER_ID", FOLDER):
         with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
             out = drive_tools.append_drive_file("f1", "שורה")
     files.export.assert_not_called()
     files.update.assert_not_called()
     assert out.startswith("❌")
+
+
+# --- full CRUD inside the working folder tree (Itai's rule, 2026-09-08) ------
+
+def test_a_file_in_a_subfolder_is_inside_the_tree_and_editable():
+    """The old direct-parent check refused every file below the first level,
+    which is exactly the wall Itai hit. The tree walk climbs the subfolder
+    and finds the working folder above it."""
+    files = MagicMock()
+    files.get.return_value.execute.side_effect = [
+        {"mimeType": "application/vnd.google-apps.document", "name": "בתת-תיקייה",
+         "parents": ["sub-folder"], "permissions": [OWNER_PERM]},
+        {"parents": [FOLDER]},  # the walk asks about sub-folder
+    ]
+    files.update.return_value.execute.return_value = {"id": "f1", "name": "בתת-תיקייה"}
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.update_drive_file("f1", "תוכן")
+    files.update.assert_called_once()
+    assert out.startswith("✅")
+
+
+def test_rename_inside_the_tree_needs_no_approval():
+    files = _editing_files({"mimeType": "application/vnd.google-apps.document",
+                            "name": "ישן", "permissions": [OWNER_PERM]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.rename_drive_file("f1", "חדש")
+    assert files.update.call_args.kwargs["body"] == {"name": "חדש"}
+    assert "ישן" in out and "חדש" in out
+
+
+def test_rename_outside_the_tree_is_refused():
+    files = _files(get={"name": "בחוץ", "parents": ["someone-elses-folder"],
+                        "permissions": [OWNER_PERM]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.rename_drive_file("f1", "חדש")
+    files.update.assert_not_called()
+    assert out.startswith("❌")
+
+
+def test_a_rename_of_a_shared_file_is_guarded_like_an_edit():
+    files = _editing_files({"mimeType": "application/vnd.google-apps.document",
+                            "name": "משותף", "permissions": [OWNER_PERM, OUTSIDER_PERM]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            refused = drive_tools.rename_drive_file("f1", "חדש")
+            allowed = drive_tools.rename_drive_file("f1", "חדש", confirmed_shared_edit=True)
+    assert refused.startswith("❌") and "dana@impact.co.il" in refused
+    assert allowed.startswith("✅")
+    assert files.update.call_count == 1
+
+
+def test_move_swaps_parents_inside_the_tree():
+    files = _editing_files({"mimeType": "application/vnd.google-apps.document",
+                            "name": "מסמך", "permissions": [OWNER_PERM]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            with patch.object(drive_tools, "_working_parent", return_value="sub-folder"):
+                out = drive_tools.move_drive_file("f1", "sub-folder")
+    kwargs = files.update.call_args.kwargs
+    assert kwargs["addParents"] == "sub-folder"
+    assert kwargs["removeParents"] == FOLDER
+    assert out.startswith("✅")
+
+
+def test_move_to_a_folder_outside_the_tree_is_refused():
+    files = _editing_files({"mimeType": "application/vnd.google-apps.document",
+                            "name": "מסמך", "permissions": [OWNER_PERM]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_working_parent", return_value=""):
+            out = drive_tools.move_drive_file("f1", "not-in-tree")
+    files.update.assert_not_called()
+    assert out.startswith("❌")
+
+
+def test_move_of_a_shared_file_is_guarded_too():
+    files = _editing_files({"mimeType": "application/vnd.google-apps.document",
+                            "name": "משותף", "permissions": [OWNER_PERM, OUTSIDER_PERM]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            with patch.object(drive_tools, "_working_parent", return_value="sub-folder"):
+                refused = drive_tools.move_drive_file("f1", "sub-folder")
+    files.update.assert_not_called()
+    assert refused.startswith("❌") and "dana@impact.co.il" in refused
+
+
+def test_binning_outside_the_tree_is_now_refused():
+    """Outside the working folder the bot is read-only again (Itai's rule,
+    2026-09-08): the old anywhere-bin is gone, and the refusal says so."""
+    files = _files(get={"name": "בחוץ", "ownedByMe": True, "trashed": False,
+                        "parents": ["someone-elses-folder"],
+                        "permissions": [OWNER_PERM]})
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(files)):
+            out = drive_tools.trash_drive_file("f1")
+    files.update.assert_not_called()
+    files.delete.assert_not_called()
+    assert out.startswith("❌")
+
+
+def test_a_file_only_the_bot_sees_is_changed_with_the_bot_write_identity(monkeypatch):
+    """A shortcut the bot filed is owned by the service account: Itai's OAuth
+    gets a 404 on it, and the change falls through to the bot's write
+    identity - inside the tree, and nowhere else."""
+    from googleapiclient.errors import HttpError
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    missing = HttpError(MagicMock(status=404), b"not found")
+    his_files = MagicMock()
+    his_files.get.return_value.execute.side_effect = missing
+    bot_files = MagicMock()
+    bot_files.get.return_value.execute.return_value = {
+        "mimeType": "application/vnd.google-apps.document", "name": "של הבוט",
+        "parents": [FOLDER], "permissions": [SA_PERM],
+    }
+    bot_files.update.return_value.execute.return_value = {"id": "f1", "name": "של הבוט"}
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(his_files)):
+            with patch.object(drive_tools, "_sa_write_drive_service",
+                              return_value=_service(bot_files)):
+                out = drive_tools.update_drive_file("f1", "תוכן")
+    bot_files.update.assert_called_once()
+    assert out.startswith("✅")
+
+
+def test_a_real_error_does_not_fall_through_to_the_write_identity(monkeypatch):
+    """A 500 is a real answer, not a visibility wall: no bot retry."""
+    from googleapiclient.errors import HttpError
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", SA_JSON)
+    broken = HttpError(MagicMock(status=500), b"boom")
+    his_files = MagicMock()
+    his_files.get.return_value.execute.side_effect = broken
+    with patch.object(drive_tools, "FOLDER_ID", FOLDER):
+        with patch.object(drive_tools, "_drive_service", return_value=_service(his_files)):
+            with patch.object(drive_tools, "_sa_write_drive_service") as bot:
+                out = drive_tools.update_drive_file("f1", "תוכן")
+    bot.assert_not_called()
+    assert out.startswith("❌")
+
+
+def test_the_new_tools_are_registered_and_the_prompt_knows_the_rule():
+    import assistant
+    assert assistant.rename_drive_file in assistant.tools_list
+    assert assistant.move_drive_file in assistant.tools_list
+    assert "unlimited" in assistant.SYSTEM_PROMPT
+    assert "rename_drive_file" in assistant.SYSTEM_PROMPT
+    assert "move_drive_file" in assistant.SYSTEM_PROMPT

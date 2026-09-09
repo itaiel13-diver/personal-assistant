@@ -122,8 +122,20 @@ def build_context(sender_id: str, incoming_text: str = "") -> dict:
     older = turns[:-RECENT_TURNS] if len(turns) > RECENT_TURNS else []
 
     needles = _words(incoming_text)
-    retrieved = sorted((t for t in older if _score(t, needles) > 0),
-                       key=lambda t: _score(t, needles), reverse=True)[:RETRIEVED_TURNS]
+    retrieved = []
+    if storage.enabled():
+        try:
+            sync_index(sender_id, turns)
+            recent_floor = len(turns) - len(recent)
+            retrieved = [t for t in storage.search_turns(sender_id, incoming_text,
+                                                         RETRIEVED_TURNS + len(recent))
+                         if turns.index(t) < recent_floor][:RETRIEVED_TURNS]                 if turns else []
+        except Exception as e:
+            logger.warning(f"Indexed retrieval failed for {sender_id}, scoring in Python: {e}")
+            retrieved = []
+    if not retrieved:
+        retrieved = sorted((t for t in older if _score(t, needles) > 0),
+                           key=lambda t: _score(t, needles), reverse=True)[:RETRIEVED_TURNS]
 
     memory_lines = []
     try:
@@ -138,7 +150,17 @@ def build_context(sender_id: str, incoming_text: str = "") -> dict:
         memory_lines.append((-_score(line, needles), line))
     memory = [line for _, line in sorted(memory_lines)[:RETRIEVED_MEMORY_LINES]]
 
-    pin_lines = [f"{k}: {v}" for k, v in (state["pin"] or {}).items()]
+    pin_lines = []
+    for k, v in (state["pin"] or {}).items():
+        # New pins are {value, updated_at}; a bare string is a pre-timestamp
+        # pin. The date rides along so the model trusts the newest write when
+        # a corrected fact and an old retrieved turn disagree.
+        if isinstance(v, dict):
+            stamp = str(v.get("updated_at", ""))[:10]
+            pin_lines.append(f"{k}: {v.get('value', '')} (עודכן {stamp})" if stamp
+                             else f"{k}: {v.get('value', '')}")
+        else:
+            pin_lines.append(f"{k}: {v}")
 
     # The topic layer: matched topic digests beat loose turn retrieval, and
     # each is capped so one runaway topic cannot eat the bundle.
@@ -202,11 +224,15 @@ def maybe_compact(sender_id: str, summarize_fn) -> bool:
     """
     history = storage.load_history(sender_id)
     turns = _turn_texts(history)
-    overflow = len(turns) - RECENT_TURNS
-    if overflow < COMPACT_THRESHOLD:
-        return False
     state = storage.load_state(sender_id)
-    batch = turns[:COMPACT_BATCH]
+    # Consume by offset: compacted_count marks how far the digests have
+    # absorbed, so each pass folds the NEXT batch and a rebuild loop
+    # terminates instead of re-digesting the first batch forever.
+    start = min(state["compacted_count"], max(0, len(turns) - RECENT_TURNS))
+    pending = len(turns) - RECENT_TURNS - start
+    if pending < COMPACT_THRESHOLD:
+        return False
+    batch = turns[start:start + COMPACT_BATCH]
     # Multi-tag: one turn feeds the digest of EVERY topic it touches, so a
     # question later finds it under any of them. One small call per topic.
     by_topic = {}
@@ -228,6 +254,42 @@ def maybe_compact(sender_id: str, summarize_fn) -> bool:
         storage.save_topic(sender_id, topic, new_summary.strip(), len(topic_turns))
         compacted_any = True
     if compacted_any:
-        storage.save_state(sender_id,
-                           compacted_count=state["compacted_count"] + len(batch))
+        storage.save_state(sender_id, compacted_count=start + len(batch))
     return compacted_any
+
+
+def sync_index(sender_id: str, turns: list = None) -> int:
+    """Index every turn not yet in turn_index. Self-healing: a wiped or
+    partial index just re-fills from the raw history, which is never deleted.
+    Returns how many new turns were indexed this call."""
+    if not storage.enabled():
+        return 0
+    if turns is None:
+        turns = _turn_texts(storage.load_history(sender_id))
+    start = storage.indexed_turn_count(sender_id)
+    for idx, turn in enumerate(turns[start:], start=start):
+        speaker, _, text = turn.partition(": ")
+        storage.index_turn(sender_id, idx, speaker, text, tag_turn(turn))
+    return max(0, len(turns) - start)
+
+
+def rebuild(sender_id: str, summarize_fn=None) -> dict:
+    """The drift repair: digests and the index are derivable, so rebuilding
+    means dropping them and recomputing from the raw conversations - which
+    stay untouched. Without a summariser (quota-dead day, maintenance run)
+    the rebuild still restores the index and clears stale digests; the next
+    post-turn compaction rewrites them. Returns what changed."""
+    sync_index(sender_id)
+    state = storage.load_state(sender_id)
+    had_topics = storage.load_topics(sender_id)
+    storage.clear_topics(sender_id)
+    compacted = 0
+    if summarize_fn is not None:
+        storage.save_state(sender_id, summary="", compacted_count=0)
+        while maybe_compact(sender_id, summarize_fn):
+            compacted += 1
+    elif state["summary"] or state["compacted_count"]:
+        storage.save_state(sender_id, summary="", compacted_count=0)
+    return {"indexed_turns": storage.indexed_turn_count(sender_id),
+            "topics_dropped": len(had_topics),
+            "compaction_passes": compacted}

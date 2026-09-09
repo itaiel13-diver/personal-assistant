@@ -2,6 +2,8 @@ import hashlib
 import hmac
 import logging
 import os
+import threading
+import time
 
 import requests
 from flask import Flask, Response, abort, jsonify, request
@@ -434,6 +436,37 @@ def terms_of_service():
 <h2>יצירת קשר / Contact</h2>
 <p>itaiel13@gmail.com</p>""",
     ), 200
+
+
+def _boot_catch_up():
+    """Answers one queued question that died mid-processing before this deploy.
+
+    A webhook message is marked processed BEFORE it is handled (PR #15), which
+    is right for Meta's retries but means a worker killed mid-reply - a long
+    throttle wait past the 120s gunicorn timeout - leaves the sender with
+    silence and no redelivery coming. When that just happened, the operator
+    sets BOOT_REPLY_SENDER/BOOT_REPLY_TEXT before the deploy and this thread
+    re-asks the exact question outside any request, where no 120s clock runs,
+    and sends the answer straight to him. No-op when the pair is unset, so a
+    normal boot costs nothing and the vars come right back out after the send.
+    """
+    sender = os.environ.get("BOOT_REPLY_SENDER", "").strip()
+    text = os.environ.get("BOOT_REPLY_TEXT", "").strip()
+    if not (sender and text):
+        return
+    # Let the worker finish booting and Render mark the deploy live before we
+    # spend quota; a few seconds changes nothing for a sender already waiting.
+    time.sleep(10)
+    try:
+        logger.info(f"Boot catch-up: answering a queued question for {sender}")
+        reply_text = handle_whatsapp_message(text, sender_id=sender)
+        _send_whatsapp_reply(sender, reply_text)
+        logger.info("Boot catch-up: reply sent")
+    except Exception:
+        logger.exception("Boot catch-up failed")
+
+
+threading.Thread(target=_boot_catch_up, daemon=True).start()
 
 
 if __name__ == "__main__":

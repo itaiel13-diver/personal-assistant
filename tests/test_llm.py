@@ -250,3 +250,50 @@ def test_every_provider_413ing_returns_none(keys, calls):
     for _ in range(6):
         calls["queue"].append(FakeResponse(status=413))
     assert llm.ask("ה" * 9000) is None
+
+
+# --- voice notes -------------------------------------------------------------
+
+
+class _RecordingPost:
+    """requests.post stand-in that also accepts multipart uploads."""
+
+    def __init__(self):
+        self.seen = []
+        self.queue = []
+
+    def __call__(self, url, headers=None, json=None, files=None, data=None, timeout=None):
+        self.seen.append({"url": url, "files": files, "data": data})
+        reply = self.queue.pop(0) if self.queue else FakeResponse(body={"text": "מה קורה"})
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def test_a_voice_note_is_transcribed_by_whisper_on_groq(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "q")
+    post = _RecordingPost()
+    monkeypatch.setattr(requests, "post", post)
+
+    assert llm.transcribe(b"ogg-bytes", "audio/ogg; codecs=opus") == "מה קורה"
+    call = post.seen[0]
+    assert "audio/transcriptions" in call["url"]
+    assert call["data"]["model"] == "whisper-large-v3"
+    assert call["files"]["file"][0] == "voice-note.ogg", "the endpoint sniffs the container from the extension"
+    assert call["files"]["file"][1] == b"ogg-bytes"
+
+
+def test_a_failed_transcription_falls_through_and_returns_none(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "q")
+    post = _RecordingPost()
+    post.queue.append(FakeResponse(status=429))
+    monkeypatch.setattr(requests, "post", post)
+    assert llm.transcribe(b"ogg-bytes", "audio/ogg") is None
+
+
+def test_an_empty_transcript_counts_as_not_heard(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "q")
+    post = _RecordingPost()
+    post.queue.append(FakeResponse(body={"text": "  "}))
+    monkeypatch.setattr(requests, "post", post)
+    assert llm.transcribe(b"ogg-bytes", "audio/ogg") is None

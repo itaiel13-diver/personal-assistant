@@ -71,6 +71,10 @@ PROVIDERS = (
         # minute) while the reply itself never arrives. "none" buys a direct
         # answer. Vision-only: the text tier's behaviour stays untouched.
         "vision_extra": {"reasoning_effort": "none"},
+        # Whisper is metered in audio seconds (7,200 an hour free), not in
+        # tokens - transcription never touches the conversation's budget.
+        "transcribe_url": "https://api.groq.com/openai/v1/audio/transcriptions",
+        "transcribe_model": "whisper-large-v3",
     },
     {
         "name": "openrouter",
@@ -273,6 +277,49 @@ def ask_image(image_bytes: bytes, mime_type: str, prompt: str, system: str = "",
 
     if tried:
         logger.error(f"Every vision provider failed: {', '.join(tried)}")
+    return None
+
+
+_AUDIO_EXT = {
+    "audio/ogg": "ogg", "audio/opus": "opus", "audio/mpeg": "mp3",
+    "audio/mp3": "mp3", "audio/mp4": "m4a", "audio/m4a": "m4a",
+    "audio/wav": "wav", "audio/x-wav": "wav", "audio/webm": "webm",
+    "audio/flac": "flac", "audio/aac": "aac",
+}
+
+
+def transcribe(audio_bytes: bytes, mime_type: str) -> str | None:
+    """Turns a voice note into text on the first provider that has an ear.
+
+    The filename's extension is how the endpoint sniffs the container, so it
+    is derived from the mime type rather than invented. None means nobody
+    heard it, and the caller asks for the note again - an empty transcript
+    must never become an answer to words nobody said.
+    """
+    ext = _AUDIO_EXT.get((mime_type or "").split(";")[0].strip().lower(), "ogg")
+    for provider in PROVIDERS:
+        url = provider.get("transcribe_url")
+        if not url:
+            continue
+        key = os.environ.get(provider["key_env"])
+        if not key:
+            continue
+        try:
+            response = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": (f"voice-note.{ext}", audio_bytes, mime_type)},
+                data={"model": provider["transcribe_model"], "response_format": "json"},
+                timeout=TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            text = (response.json().get("text") or "").strip()
+            if text:
+                logger.info(f"Voice note transcribed by {provider['name']}")
+                return text
+            logger.warning(f"{provider['name']} returned an empty transcript; falling through")
+        except Exception as e:
+            logger.warning(f"{provider['name']} transcription failed ({e}); falling through")
     return None
 
 

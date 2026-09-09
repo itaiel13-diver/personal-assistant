@@ -623,7 +623,8 @@ def _plain_history(sender_id: str, turns: int = 12) -> str:
 
 
 def _answer_without_gemini(incoming_text: str, sender_id: str,
-                           extra_context: str = "") -> str | None:
+                           extra_context: str = "",
+                           wait_budget: float | None = None) -> str | None:
     """Answers on a spare free tier once Gemini's daily quota is gone.
 
     Two modes. A message that names something actionable - a task, the
@@ -665,6 +666,7 @@ def _answer_without_gemini(incoming_text: str, sender_id: str,
             max_tokens=800,
             temperature=0.3,
             skip=("gemini",),
+            **({"wait_budget": wait_budget} if wait_budget is not None else {}),
         )
         if reply:
             logger.info(f"Answered {sender_id} on the fallback tier with tools {packs}")
@@ -695,6 +697,7 @@ def _answer_without_gemini(incoming_text: str, sender_id: str,
         max_tokens=800,
         temperature=0.3,
         skip=("gemini",),
+        **({"wait_budget": wait_budget} if wait_budget is not None else {}),
     )
     if not reply:
         return None
@@ -775,7 +778,8 @@ def _quota_dead_end_message() -> str:
             "לא ענו. המכסה מתאפסת מחר, או שאפשר לשדרג את התוכנית.")
 
 
-def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> str:
+def handle_whatsapp_message(incoming_text: str, sender_id: str = "default",
+                            wait_budget: float | None = None) -> str:
     """
     Handles an incoming WhatsApp message from a given sender, restoring the
     conversation from storage so it survives restarts, and executing function
@@ -808,7 +812,8 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default") -> s
         # so telling the sender "temporary, try again in a moment" would be a lie.
         # It is, however, exactly what the second and third free tiers are for.
         if getattr(e, "code", None) == 429:
-            spare = _answer_without_gemini(incoming_text, sender_id)
+            spare = _answer_without_gemini(incoming_text, sender_id,
+                                           wait_budget=wait_budget)
             if spare:
                 return spare
             return _quota_dead_end_message()

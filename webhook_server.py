@@ -459,7 +459,12 @@ def _boot_catch_up():
     time.sleep(10)
     try:
         logger.info(f"Boot catch-up: answering a queued question for {sender}")
-        reply_text = handle_whatsapp_message(text, sender_id=sender)
+        # No 120s worker clock out here, so the usual 75s wait budget is
+        # needlessly fatal: a throttled tier answers in two or three minutes
+        # if it is allowed to wait, and the alternative is another dead-end
+        # message to a sender who already received one.
+        reply_text = handle_whatsapp_message(text, sender_id=sender,
+                                             wait_budget=300.0)
         _send_whatsapp_reply(sender, reply_text)
         logger.info("Boot catch-up: reply sent")
     except Exception:

@@ -23,23 +23,20 @@ def _patch(monkeypatch, script):
 
 
 def test_ask_skips_a_wait_that_would_blow_the_budget(monkeypatch):
-    monkeypatch.setattr(llm, "_WAIT_BUDGET_SECONDS", 10)
     seen = _patch(monkeypatch, [FakeResponse(429, retry_after=30), FakeResponse(200, "מעולה")])
     # the 30s wait would exceed the 10s budget: no sleep, no second try, None
-    assert llm.ask("שאלה") is None
+    assert llm.ask("שאלה", wait_budget=10) is None
     assert seen["n"] == 1
     assert "sleeps" not in seen
 
 
 def test_ask_still_waits_when_the_budget_allows(monkeypatch):
-    monkeypatch.setattr(llm, "_WAIT_BUDGET_SECONDS", 90)
     seen = _patch(monkeypatch, [FakeResponse(429, retry_after=30), FakeResponse(200, "מעולה")])
-    assert llm.ask("שאלה") == "מעולה"
+    assert llm.ask("שאלה", wait_budget=90) == "מעולה"
     assert seen["sleeps"] == [31.0]
 
 
 def test_tool_loop_stops_sleeping_once_the_budget_is_spent(monkeypatch):
-    monkeypatch.setattr(llm, "_WAIT_BUDGET_SECONDS", 12)
     tools = [{"type": "function", "function": {"name": "t", "description": "d",
               "parameters": {"type": "object", "properties": {}, "required": []}}}]
     call = {"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}
@@ -50,7 +47,23 @@ def test_tool_loop_stops_sleeping_once_the_budget_is_spent(monkeypatch):
         FakeResponse(200, body={"choices": [{"message": {"content": "לא אמור להגיע"}}]}),
     ]
     seen = _patch(monkeypatch, script)
-    answer = llm.ask_with_tools("תעשה", None, tools, lambda n, a: "ok")
+    answer = llm.ask_with_tools("תעשה", None, tools, lambda n, a: "ok", wait_budget=12)
     assert answer is None
     assert seen["sleeps"] == [6.0]
     assert seen["n"] == 3  # the over-budget wait never became a request
+
+
+def test_tool_loop_honours_an_explicit_wait_budget(monkeypatch):
+    tools = [{"type": "function", "function": {"name": "t", "description": "d",
+              "parameters": {"type": "object", "properties": {}, "required": []}}}]
+    call = {"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+    script = [
+        FakeResponse(429, retry_after=45),
+        FakeResponse(200, body={"choices": [{"message": {"tool_calls": [call]}}]}),
+        FakeResponse(429, retry_after=45),                   # two waits a request could not afford
+        FakeResponse(200, body={"choices": [{"message": {"content": "נענה"}}]}),
+    ]
+    seen = _patch(monkeypatch, script)
+    answer = llm.ask_with_tools("תעשה", None, tools, lambda n, a: "ok", wait_budget=200)
+    assert answer == "נענה"
+    assert seen["sleeps"] == [46.0, 46.0]

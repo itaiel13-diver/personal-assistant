@@ -9,7 +9,8 @@ def test_catch_up_is_a_noop_without_the_env_pair(monkeypatch):
     monkeypatch.delenv("BOOT_REPLY_TEXT", raising=False)
     monkeypatch.setattr(webhook_server.time, "sleep", lambda s: None)
     called = []
-    monkeypatch.setattr(webhook_server, "handle_whatsapp_message", lambda t, sender_id: called.append(t) or "x")
+    monkeypatch.setattr(webhook_server, "handle_whatsapp_message",
+                        lambda t, **kw: called.append(t) or "x")
     webhook_server._boot_catch_up()
     assert called == []
 
@@ -19,10 +20,18 @@ def test_catch_up_reasks_and_sends(monkeypatch):
     monkeypatch.setenv("BOOT_REPLY_TEXT", "מה יש לי בטודו?")
     monkeypatch.setattr(webhook_server.time, "sleep", lambda s: None)
     seen = {}
-    monkeypatch.setattr(webhook_server, "handle_whatsapp_message",
-                        lambda t, sender_id: seen.update(asked=(t, sender_id)) or "הרשימה")
+
+    def fake_handle(t, **kw):
+        seen["asked"] = (t, kw)
+        return "הרשימה"
+
+    monkeypatch.setattr(webhook_server, "handle_whatsapp_message", fake_handle)
     monkeypatch.setattr(webhook_server, "_send_whatsapp_reply",
                         lambda to, text: seen.update(sent=(to, text)))
     webhook_server._boot_catch_up()
-    assert seen["asked"] == ("מה יש לי בטודו?", "972500000000")
+    assert seen["asked"][0] == "מה יש לי בטודו?"
+    assert seen["asked"][1]["sender_id"] == "972500000000"
+    # outside a request there is no 120s clock: the catch-up buys the
+    # throttled tier real waiting room instead of another dead-end message
+    assert seen["asked"][1]["wait_budget"] == 300.0
     assert seen["sent"] == ("972500000000", "הרשימה")

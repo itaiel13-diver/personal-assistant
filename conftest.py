@@ -10,3 +10,17 @@ os.environ.setdefault("META_VERIFY_TOKEN", "test-verify-token")
 os.environ.setdefault("META_APP_SECRET", "test-app-secret")
 os.environ.setdefault("WHATSAPP_TOKEN", "test-whatsapp-token")
 os.environ.setdefault("PHONE_NUMBER_ID", "test-phone-number-id")
+
+
+# Webhook payloads across many test files share the same Meta message id
+# ("wamid.test"); with delivery dedupe in place, one file's message would eat
+# another's. Every test gets a fresh dedupe memory.
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _fresh_dedupe_state():
+    import webhook_server
+    webhook_server._SEEN_MESSAGE_IDS.clear()
+    yield
+    webhook_server._SEEN_MESSAGE_IDS.clear()

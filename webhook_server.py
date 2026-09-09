@@ -157,8 +157,9 @@ def _is_owner(sender: str) -> bool:
 
 
 def _extract_incoming_message(payload: dict):
-    """Returns (sender, text, message_type, media) for the first message in a
-    Meta webhook payload, or (None, None, None, None) for non-message events
+    """Returns (sender, text, message_type, media, message_id) for the first
+    message in a Meta webhook payload, or (None, None, None, None, None) for
+    non-message events
     (delivery/read receipts, template status updates, etc.) which Meta also
     sends to this same webhook. message_type is Meta's own type string
     ('text', 'image', 'audio', 'location', ...) so the caller can tell a real
@@ -172,9 +173,10 @@ def _extract_incoming_message(payload: dict):
         value = payload["entry"][0]["changes"][0]["value"]
         messages = value.get("messages")
         if not messages:
-            return None, None, None, None
+            return None, None, None, None, None
         message = messages[0]
         sender = message.get("from")
+        message_id = message.get("id")
         message_type = message.get("type", "unknown")
         text = message.get("text", {}).get("body", "") if message_type == "text" else ""
         media = None
@@ -188,9 +190,34 @@ def _extract_incoming_message(payload: dict):
                 # the dispatch signal - the extension decides how it is read.
                 "filename": info.get("filename", ""),
             }
-        return sender, text, message_type, media
+        return sender, text, message_type, media, message_id
     except (KeyError, IndexError, TypeError):
-        return None, None, None, None
+        return None, None, None, None, None
+
+
+# Meta retries a webhook delivery until it gets a fast 200, and a slow answer
+# (quota waits, tool loops) arrives again and again. Every retry must be a
+# no-op: Postgres remembers across restarts, the in-memory set covers the
+# no-database case within one process.
+_SEEN_MESSAGE_IDS = set()
+_SEEN_MESSAGE_IDS_LIMIT = 5000
+
+
+def _message_already_processed(message_id: str) -> bool:
+    if not message_id:
+        return False
+    if message_id in _SEEN_MESSAGE_IDS:
+        return True
+    return storage.message_seen(message_id)
+
+
+def _mark_message_processed(message_id: str) -> None:
+    if not message_id:
+        return
+    if len(_SEEN_MESSAGE_IDS) >= _SEEN_MESSAGE_IDS_LIMIT:
+        _SEEN_MESSAGE_IDS.clear()
+    _SEEN_MESSAGE_IDS.add(message_id)
+    storage.mark_message(message_id)
 
 
 @app.route("/webhook", methods=["GET"])
@@ -211,11 +238,17 @@ def receive_webhook():
         abort(403)
 
     payload = request.get_json(silent=True) or {}
-    sender, text, message_type, media = _extract_incoming_message(payload)
+    sender, text, message_type, media, message_id = _extract_incoming_message(payload)
 
     if sender and not _is_owner(sender):
         logger.warning(f"Message from a non-owner number ({sender}) - ignored.")
         return "OK", 200
+
+    if message_id:
+        if _message_already_processed(message_id):
+            logger.info(f"Duplicate delivery of {message_id} - acknowledged, not reprocessed.")
+            return "OK", 200
+        _mark_message_processed(message_id)
 
     if sender:
         # Itai writing is what reopens WhatsApp's 24-hour window, and the

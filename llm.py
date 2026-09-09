@@ -205,7 +205,8 @@ def _retry_after_seconds(error) -> float | None:
 
 
 def ask(prompt: str, system: str = "", max_tokens: int = 600,
-        temperature: float = 0.2, skip: tuple = ()) -> str | None:
+        temperature: float = 0.2, skip: tuple = (),
+        wait_budget: float = _WAIT_BUDGET_SECONDS) -> str | None:
     """Asks the first provider that has quota, and returns None if none do.
 
     None is a real answer here and callers must handle it: it means the routine
@@ -260,8 +261,8 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
             # provider IS the retry.
             wait = _retry_after_seconds(e)
             if status == 429 and wait is not None and wait <= _429_MAX_WAIT_SECONDS:
-                if time.monotonic() - started + wait + 1 > _WAIT_BUDGET_SECONDS:
-                    logger.warning(f"{provider['name']} throttle wait ({wait:.0f}s) would blow the {_WAIT_BUDGET_SECONDS:.0f}s budget; falling through")
+                if time.monotonic() - started + wait + 1 > wait_budget:
+                    logger.warning(f"{provider['name']} throttle wait ({wait:.0f}s) would blow the {wait_budget:.0f}s budget; falling through")
                     continue
                 logger.warning(f"{provider['name']} throttled for {wait:.0f}s; waiting once")
                 time.sleep(wait + 1)
@@ -288,7 +289,8 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
 
 def ask_with_tools(prompt: str, system: str, tools: list, call_tool,
                    max_tokens: int = 800, temperature: float = 0.2,
-                   max_rounds: int = 5, skip: tuple = ()) -> str | None:
+                   max_rounds: int = 5, skip: tuple = (),
+                   wait_budget: float = _WAIT_BUDGET_SECONDS) -> str | None:
     """ask(), with hands: the model may call tools, and this loop runs them.
 
     Each round posts the running conversation with the schemas. A reply that
@@ -302,6 +304,11 @@ def ask_with_tools(prompt: str, system: str, tools: list, call_tool,
     Only providers flagged "tools" take part; a text-only provider must never
     be sent schemas it cannot act on. None means no provider finished the
     job, which the caller handles exactly like llm.ask returning None.
+
+    wait_budget caps the total seconds this call may spend asleep on
+    throttles. The default fits inside the webhook worker's 120s lifespan;
+    callers running outside a request (the boot catch-up) pass a larger one,
+    because a killed answer there is silence the sender never sees retried.
     """
     base_messages = []
     if system:
@@ -336,8 +343,8 @@ def ask_with_tools(prompt: str, system: str, tools: list, call_tool,
                         break
                 elif status == 429 and (_retry_after_seconds(e) or 9e9) <= _429_MAX_WAIT_SECONDS:
                     wait = _retry_after_seconds(e) + 1
-                    if time.monotonic() - started + wait > _WAIT_BUDGET_SECONDS:
-                        logger.warning(f"{provider['name']} throttle wait ({wait:.0f}s) would blow the {_WAIT_BUDGET_SECONDS:.0f}s budget; falling through")
+                    if time.monotonic() - started + wait > wait_budget:
+                        logger.warning(f"{provider['name']} throttle wait ({wait:.0f}s) would blow the {wait_budget:.0f}s budget; falling through")
                         break
                     logger.warning(f"{provider['name']} throttled for {wait:.0f}s; waiting once")
                     time.sleep(wait)

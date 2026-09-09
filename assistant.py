@@ -9,6 +9,7 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
+import context_manager
 import storage
 import llm
 import reminders
@@ -533,11 +534,33 @@ def _date_context() -> str:
     return f"\n\n[CURRENT DATE AND TIME IN ISRAEL]: {now.strftime('%A, %d/%m/%Y, %H:%M')}"
 
 
-def _build_config() -> types.GenerateContentConfig:
-    """Rebuilt for every message so the date and the long-term memory are always
+def _context_system(sender_id: str = "", for_text: str = "") -> str:
+    """The bounded bundle as system context: pins, rolling summary and
+    retrieved memory/turns - never the full history, never the full memory
+    dump. The recent window rides in the chat history itself, so it is left
+    out here to avoid paying for it twice."""
+    if not sender_id:
+        return ""
+    try:
+        bundle = context_manager.build_context(sender_id, for_text)
+        parts = []
+        if bundle["pin"]:
+            parts.append("[פריטים פתוחים - מדויק, לא לסכם]:\n" + "\n".join(bundle["pin"]))
+        if bundle["summary"]:
+            parts.append("[סיכום השיחה עד כה]:\n" + bundle["summary"])
+        if bundle["retrieved"]:
+            parts.append("[פניני עבר וזכרון רלוונטיים]:\n" + "\n".join(bundle["retrieved"]))
+        return ("\n\n" + "\n\n".join(parts)) if parts else ""
+    except Exception as e:
+        logger.error(f"Context bundle failed for {sender_id}: {e}")
+        return ""
+
+
+def _build_config(sender_id: str = "", for_text: str = "") -> types.GenerateContentConfig:
+    """Rebuilt for every message so the date and the relevant context are always
     current, however old the stored conversation is."""
     return types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT + _load_memory_context() + _date_context(),
+        system_instruction=SYSTEM_PROMPT + _context_system(sender_id, for_text) + _date_context(),
         tools=tools_list,
     )
 
@@ -557,13 +580,16 @@ def _deserialise(raw: list) -> list:
     return restored
 
 
-def _get_session(sender_id: str):
-    """Returns a chat rehydrated from stored history. Without a database this
-    degrades to a per-process cache that a restart wipes."""
+def _get_session(sender_id: str, for_text: str = ""):
+    """Returns a chat rehydrated from the RECENT stored history only; the rest
+    of the conversation arrives through the bounded context bundle in the
+    system instruction. Without a database this degrades to a per-process
+    cache that a restart wipes."""
     if storage.enabled():
-        history = _deserialise(storage.load_history(sender_id))
+        full = storage.load_history(sender_id)
+        history = _deserialise(full[-context_manager.RECENT_TURNS:])
         return _retry_on_server_error(lambda: client.chats.create(
-            model=MODEL_NAME, config=_build_config(), history=history
+            model=MODEL_NAME, config=_build_config(sender_id, for_text), history=history
         ))
 
     today = datetime.now(ISRAEL_TZ).date()
@@ -644,9 +670,11 @@ def _answer_without_gemini(incoming_text: str, sender_id: str,
     if packs:
         registry = tool_bridge.build_registry(tools_list)
         schemas = tool_bridge.tools_for(packs, registry)
+        _bundle_text = context_manager.render(
+            context_manager.build_context(sender_id, incoming_text))
         reply = llm.ask_with_tools(
-            f"{_plain_history(sender_id)}\n{extra_context}\nItai: {incoming_text}" if extra_context
-            else f"{_plain_history(sender_id)}\nItai: {incoming_text}",
+            f"{_bundle_text}\n{extra_context}\nItai: {incoming_text}" if extra_context
+            else f"{_bundle_text}\nItai: {incoming_text}",
             system=(
                 SYSTEM_PROMPT
                 + _load_memory_context()
@@ -677,6 +705,7 @@ def _answer_without_gemini(incoming_text: str, sender_id: str,
                 # produced, or the next question arrives with a hole.
                 storage.append_user_turn(sender_id, incoming_text)
                 storage.append_model_turn(sender_id, reply)
+            _compact_after_turn(sender_id)
             return reply
         logger.info("Tool-enabled fallback produced no answer; trying the tool-less one")
 
@@ -685,7 +714,7 @@ def _answer_without_gemini(incoming_text: str, sender_id: str,
     # cannot look up - still far better than the dead end this replaced,
     # where hitting the quota at 11am meant no assistant at all until midnight.
     reply = llm.ask(
-        f"{_plain_history(sender_id)}\nItai: {incoming_text}",
+        f"{context_manager.render(context_manager.build_context(sender_id, incoming_text))}\nItai: {incoming_text}",
         system=(
             SYSTEM_PROMPT
             + _load_memory_context()
@@ -780,6 +809,26 @@ def _quota_dead_end_message() -> str:
             "לא ענו. המכסה מתאפסת מחר, או שאפשר לשדרג את התוכנית.")
 
 
+def _summarise_for_compaction(existing: str, turns_text: str) -> str:
+    """The after-turn digest call: small, on the spare tiers, and skipped
+    entirely on a quota-dead day - maybe_compact treats a failure as 'not
+    now', never as data loss."""
+    prompt = (
+        "זה הסיכום המצטבר של השיחה עד כה:\n" + (existing or "(ריק)")
+        + "\n\nאלו התורנויות הישנות הבאות:\n" + turns_text
+        + "\n\nכתוב סיכום מצטבר חדש, עד 15 שורות, בעברית: החלטות, בקשות "
+          "פתוחות, אישורים, מזהים ופרטים שהוא יצפה שאזכור. בלי נימוסים."
+    )
+    return llm.ask(prompt, max_tokens=700, temperature=0.1) or ""
+
+
+def _compact_after_turn(sender_id: str) -> None:
+    try:
+        context_manager.maybe_compact(sender_id, _summarise_for_compaction)
+    except Exception as e:
+        logger.warning(f"Post-turn compaction skipped: {e}")
+
+
 def handle_whatsapp_message(incoming_text: str, sender_id: str = "default",
                             wait_budget: float | None = None) -> str:
     """
@@ -804,10 +853,11 @@ def handle_whatsapp_message(incoming_text: str, sender_id: str = "default",
         # nothing stops it, and on a live question it did exactly that; the
         # cap lives in web_tools and this is where the count is zeroed.
         begin_web_budget()
-        chat = _get_session(sender_id)
+        chat = _get_session(sender_id, incoming_text)
         response = _send_with_retry(chat, incoming_text)
         if storage.enabled():
             storage.save_history(sender_id, _serialise(chat.get_history()))
+        _compact_after_turn(sender_id)
     except genai_errors.ClientError as e:
         logger.error(f"Gemini client error for sender {sender_id}: {e}")
         # A 429 on the free tier is a daily quota that will not clear on a retry,

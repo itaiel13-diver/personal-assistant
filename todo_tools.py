@@ -312,6 +312,12 @@ def create_todo_task(
         return "❌ אין כותרת למשימה."
     try:
         target = _resolve_list(list_name)
+        # A batch that died mid-loop gets retried as a whole; without this
+        # check the tasks that DID get created would be duplicated.
+        wanted = title.strip().lower()
+        for task in _tasks(target["id"], False):
+            if (task.get("title") or "").strip().lower() == wanted:
+                return f'ℹ️ כבר קיימת משימה פתוחה בשם "{title.strip()}" - לא נוצרה כפילות.'
         body = {"title": title.strip()}
 
         if (importance or "").strip() in IMPORTANCE:

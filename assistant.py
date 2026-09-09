@@ -594,6 +594,10 @@ def _send_with_retry(chat, text: str, attempts: int = 3):
         return _retry_on_server_error(send, attempts=attempts)
     except genai_errors.ClientError as e:
         delay = _asked_retry_delay_seconds(e)
+        # A per-DAY cap sometimes lies with a short retryDelay (the next minute
+        # boundary), but waiting does not clear it - only midnight does.
+        if "PerDay" in str(e):
+            raise
         if getattr(e, "code", None) == 429 and delay is not None and delay <= _MINUTE_QUOTA_MAX_WAIT_SECONDS:
             logger.warning(f"Gemini per-minute quota - waiting {delay:.0f}s and retrying once")
             time.sleep(delay + 1)

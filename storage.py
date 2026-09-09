@@ -128,6 +128,25 @@ def _ensure_schema(conn) -> None:
             )
         """)
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS sender_state (
+                sender_id       TEXT PRIMARY KEY,
+                summary         TEXT NOT NULL DEFAULT '',
+                pin             JSONB NOT NULL DEFAULT '{}'::jsonb,
+                compacted_count INT NOT NULL DEFAULT 0,
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sender_topics (
+                sender_id  TEXT NOT NULL,
+                topic      TEXT NOT NULL,
+                summary    TEXT NOT NULL DEFAULT '',
+                turns      INT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (sender_id, topic)
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS memory (
                 key        TEXT PRIMARY KEY,
                 value      TEXT NOT NULL,
@@ -755,3 +774,113 @@ def cancel_reminder(reminder_id: int, sender_id: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to cancel reminder {reminder_id}: {e}")
         return False
+
+
+def load_state(sender_id: str) -> dict:
+    """The compaction state for one conversation: rolling summary, pinned
+    facts, and how many entries the summary has absorbed so far. Anything
+    failure-shaped returns the empty state - a missing summary is a longer
+    prompt, never a wrong one."""
+    empty = {"summary": "", "pin": {}, "compacted_count": 0}
+    if not enabled():
+        return empty
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT summary, pin, compacted_count FROM sender_state WHERE sender_id = %s",
+                    (sender_id,))
+                row = cur.fetchone()
+        if not row:
+            return empty
+        return {"summary": row[0] or "", "pin": row[1] or {}, "compacted_count": row[2] or 0}
+    except Exception as e:
+        logger.error(f"Failed to load state for {sender_id}: {e}")
+        return empty
+
+
+def save_state(sender_id: str, summary=None, pin=None, compacted_count=None) -> None:
+    if not enabled():
+        return
+    try:
+        current = load_state(sender_id)
+        summary = current["summary"] if summary is None else summary
+        pin = current["pin"] if pin is None else pin
+        compacted_count = current["compacted_count"] if compacted_count is None else compacted_count
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO sender_state (sender_id, summary, pin, compacted_count, updated_at)
+                    VALUES (%s, %s, %s, now(), %s)
+                    ON CONFLICT (sender_id) DO UPDATE SET
+                        summary = EXCLUDED.summary,
+                        pin = EXCLUDED.pin,
+                        compacted_count = EXCLUDED.compacted_count,
+                        updated_at = now()
+                    """,
+                    (sender_id, summary, json.dumps(pin, ensure_ascii=False), compacted_count),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to save state for {sender_id}: {e}")
+
+
+def pin_fact(sender_id: str, key: str, value: str) -> None:
+    """One fact that must survive every compaction verbatim: a pending plan,
+    an approval he gave, an id a later step depends on. Pins render into every
+    context bundle ahead of everything else and are never summarised."""
+    state = load_state(sender_id)
+    pin = dict(state["pin"])
+    pin[key] = value
+    save_state(sender_id, pin=pin)
+
+
+def unpin_fact(sender_id: str, key: str) -> None:
+    state = load_state(sender_id)
+    pin = dict(state["pin"])
+    if key in pin:
+        del pin[key]
+        save_state(sender_id, pin=pin)
+
+
+def load_topics(sender_id: str) -> dict:
+    """Every topic's rolling summary for one conversation: {topic: summary}."""
+    if not enabled():
+        return {}
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT topic, summary FROM sender_topics WHERE sender_id = %s",
+                    (sender_id,))
+                return {t: s or "" for t, s in cur.fetchall()}
+    except Exception as e:
+        logger.error(f"Failed to load topics for {sender_id}: {e}")
+        return {}
+
+
+def save_topic(sender_id: str, topic: str, summary: str, added_turns: int) -> None:
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO sender_topics (sender_id, topic, summary, turns, updated_at)
+                    VALUES (%s, %s, %s, %s, now())
+                    ON CONFLICT (sender_id, topic) DO UPDATE SET
+                        summary = EXCLUDED.summary,
+                        turns = sender_topics.turns + EXCLUDED.turns,
+                        updated_at = now()
+                    """,
+                    (sender_id, topic, summary, added_turns),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to save topic {topic} for {sender_id}: {e}")

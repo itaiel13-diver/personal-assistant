@@ -45,6 +45,7 @@ from drive_tools import (
     update_drive_file,
 )
 import attachment_readers
+import tool_bridge
 from media_tools import base_mime
 from todo_tools import (
     add_todo_checklist_item,
@@ -596,11 +597,52 @@ def _plain_history(sender_id: str, turns: int = 12) -> str:
 def _answer_without_gemini(incoming_text: str, sender_id: str) -> str | None:
     """Answers on a spare free tier once Gemini's daily quota is gone.
 
-    This is a genuinely reduced assistant: no tools, so no mail, calendar, drive
-    or web - and it says so itself rather than inventing an answer it cannot
-    look up. That is still far better than the dead end this replaced, where
-    hitting the quota at 11am meant no assistant at all until midnight.
+    Two modes. A message that names something actionable - a task, the
+    calendar, mail, Drive, a search - goes through the tool loop: the
+    matching pack of schemas rides along, the model calls the real functions,
+    and the guards inside them (working-tree restrictions, shared-file
+    confirmations, disambiguation refusals) hold exactly as they do for
+    Gemini. Everything else keeps the old tool-less answer, because paying
+    thousands of schema tokens for small talk is how a free tier dies twice.
     """
+    packs = tool_bridge.select_packs(incoming_text)
+    if packs:
+        registry = tool_bridge.build_registry(tools_list)
+        schemas = tool_bridge.tools_for(packs, registry)
+        reply = llm.ask_with_tools(
+            f"{_plain_history(sender_id)}\nItai: {incoming_text}",
+            system=(
+                SYSTEM_PROMPT
+                + _load_memory_context()
+                + _date_context()
+                + "\n\nIMPORTANT, ONLY FOR THIS REPLY: you are running on the backup "
+                "model with a REDUCED set of tools - only the tools offered to you "
+                "exist right now. If the request needs a tool you do not have, say "
+                "plainly that the daily AI quota ran out and you will be able to do "
+                "it later - never pretend you did it. Every other rule still applies: "
+                "confirm destructive actions exactly as the tool descriptions require, "
+                "and answer in Hebrew."
+            ),
+            tools=schemas,
+            call_tool=lambda name, args: tool_bridge.dispatch(registry, name, args),
+            max_tokens=800,
+            temperature=0.3,
+            skip=("gemini",),
+        )
+        if reply:
+            logger.info(f"Answered {sender_id} on the fallback tier with tools {packs}")
+            if storage.enabled():
+                # The conversation must record what was said however it was
+                # produced, or the next question arrives with a hole.
+                storage.append_user_turn(sender_id, incoming_text)
+                storage.append_model_turn(sender_id, reply)
+            return reply
+        logger.info("Tool-enabled fallback produced no answer; trying the tool-less one")
+
+    # Tool-less mode: no pack matched, or the tool loop failed. A genuinely
+    # reduced assistant that says so rather than inventing an answer it
+    # cannot look up - still far better than the dead end this replaced,
+    # where hitting the quota at 11am meant no assistant at all until midnight.
     reply = llm.ask(
         f"{_plain_history(sender_id)}\nItai: {incoming_text}",
         system=(

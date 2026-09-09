@@ -48,6 +48,7 @@ PROVIDERS = (
         "model": "gemini-3.6-flash",
         # The chat model is already multimodal, so vision needs no second id.
         "vision": True,
+        "tools": False,
     },
     {
         "name": "groq",
@@ -75,6 +76,9 @@ PROVIDERS = (
         # tokens - transcription never touches the conversation's budget.
         "transcribe_url": "https://api.groq.com/openai/v1/audio/transcriptions",
         "transcribe_model": "whisper-large-v3",
+        # gpt-oss-120b speaks function calling; schemas cost tokens, so only
+        # providers flagged here are ever shown them.
+        "tools": True,
     },
     {
         "name": "openrouter",
@@ -84,6 +88,7 @@ PROVIDERS = (
         "model": "meta-llama/llama-3.3-70b-instruct:free",
         # The default free model is text-only; never show it a photo.
         "vision": False,
+        "tools": False,
     },
 )
 
@@ -95,6 +100,35 @@ def available() -> list:
 
 def _model_for(provider: dict) -> str:
     return os.environ.get(provider["model_env"]) or provider["model"]
+
+
+def _ask_one_full(provider: dict, messages: list, max_tokens: int, temperature: float,
+                  model: str = None, extra: dict = None, tools: list = None) -> dict:
+    """One request, whole body back - the tool loop needs the tool_calls the
+    plain path throws away."""
+    key = os.environ.get(provider["key_env"])
+    body = {
+        "model": model or _model_for(provider),
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if extra:
+        body.update(extra)
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    response = requests.post(
+        provider["url"],
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def _ask_one(provider: dict, messages: list, max_tokens: int, temperature: float,
@@ -203,6 +237,91 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
         logger.info("No LLM provider is configured - set GROQ_API_KEY for a free 1,000/day tier")
     else:
         logger.error(f"Every LLM provider failed: {', '.join(tried)}")
+    return None
+
+
+
+def ask_with_tools(prompt: str, system: str, tools: list, call_tool,
+                   max_tokens: int = 800, temperature: float = 0.2,
+                   max_rounds: int = 5, skip: tuple = ()) -> str | None:
+    """ask(), with hands: the model may call tools, and this loop runs them.
+
+    Each round posts the running conversation with the schemas. A reply that
+    carries tool_calls is executed through call_tool(name, arguments_json) ->
+    str, the results are appended, and the model is asked again, until it
+    answers in words. The round cap exists because every round is a request
+    against the free tier's 1,000-a-day budget - a model that will not stop
+    calling tools gets cut off, and the caller degrades to the tool-less
+    answer rather than leave the sender empty-handed.
+
+    Only providers flagged "tools" take part; a text-only provider must never
+    be sent schemas it cannot act on. None means no provider finished the
+    job, which the caller handles exactly like llm.ask returning None.
+    """
+    base_messages = []
+    if system:
+        base_messages.append({"role": "system", "content": system})
+    base_messages.append({"role": "user", "content": prompt})
+
+    tried = []
+    for provider in PROVIDERS:
+        if provider["name"] in skip:
+            continue
+        if not provider.get("tools"):
+            continue
+        if not os.environ.get(provider["key_env"]):
+            continue
+        tried.append(provider["name"])
+        working = list(base_messages)
+        for round_no in range(1, max_rounds + 1):
+            try:
+                body = _ask_one_full(provider, working, max_tokens, temperature, tools=tools)
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                if status == 413:
+                    # Too fat for the minute's budget: trim and give this
+                    # provider one more shot before falling through.
+                    logger.warning(f"{provider['name']} 413 on a tool call; retrying trimmed")
+                    working = _shrink_for_tpm(working)
+                    try:
+                        body = _ask_one_full(provider, working, max_tokens, temperature, tools=tools)
+                    except Exception as e2:
+                        logger.warning(f"{provider['name']} failed even trimmed ({e2}); falling through")
+                        break
+                else:
+                    logger.warning(f"{provider['name']} refused with HTTP {status}; falling through")
+                    break
+            except Exception as e:
+                logger.warning(f"{provider['name']} failed ({e}); falling through")
+                break
+
+            choice = (body.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                answer = _strip_thinking((message.get("content") or "").strip())
+                if answer:
+                    logger.info(f"LLM with tools answered by {provider['name']} (round {round_no})")
+                    return answer
+                logger.warning(f"{provider['name']} returned an empty answer; falling through")
+                break
+
+            working.append(message)
+            for call in tool_calls:
+                function = call.get("function") or {}
+                name = function.get("name") or ""
+                logger.info(f"{provider['name']} called tool {name} (round {round_no})")
+                result = call_tool(name, function.get("arguments") or "{}")
+                working.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or "",
+                    "content": result,
+                })
+        else:
+            logger.warning(f"{provider['name']} hit the {max_rounds}-round tool cap; falling through")
+
+    if tried:
+        logger.error(f"Every tool-capable provider failed: {', '.join(tried)}")
     return None
 
 

@@ -457,6 +457,73 @@ def reopen_todo_task(task: str, list_name: str = "") -> str:
         return _fail("להחזיר את המשימה לרשימה", e)
 
 
+def _dupe_key(task: dict) -> str:
+    """What makes two tasks the same job: the store, not the wording.
+
+    A retry storm writes the same store visit as the full sentence, a cut-off
+    half of it, and the bare store name - exact titles never match, which is
+    how fourteen copies of one task survive an exact-title dedupe. The part
+    before the first colon is the store; no colon means the whole title.
+    """
+    title = (task.get("title") or "").strip()
+    head = title.split(":", 1)[0] if ":" in title else title
+    return " ".join(head.split()).lower()
+
+
+def dedupe_todo_tasks(list_name: str = "", confirm: bool = False) -> str:
+    """Finds duplicate copies of the same task and deletes the extras BY ID.
+
+    Duplicates happen when a batch is retried: same store, slightly different
+    wording or a truncated tail, so the exact-title guard cannot see them.
+    Tasks group by the part before the colon (the store); in each group the
+    keeper is the most complete copy (longest title, then earliest created)
+    and the rest are deleted by their Graph ids - never by name, so nothing
+    ambiguous is touched.
+
+    Args:
+        list_name: Which list to clean. Leave empty for his default list.
+        confirm: False shows the keep/delete plan and changes nothing; True
+            deletes. Always call with False first, show him the plan, and only
+            pass True after he explicitly agrees to it.
+    """
+    if not msgraph.configured():
+        return NOT_CONNECTED
+    try:
+        target = _resolve_list(list_name)
+        groups = {}
+        for task in _tasks(target["id"]):
+            groups.setdefault(_dupe_key(task), []).append(task)
+        plan = []
+        for key, copies in groups.items():
+            if len(copies) < 2:
+                continue
+            keeper = sorted(copies,
+                            key=lambda t: (-len(t.get("title") or ""),
+                                           t.get("createdDateTime") or ""))[0]
+            extras = [t for t in copies if t is not keeper]
+            plan.append((keeper, extras))
+        if not plan:
+            return f'אין כפילויות ברשימה "{target.get("displayName")}".'
+        lines = []
+        for keeper, extras in plan:
+            lines.append(f'נשארת: {keeper.get("title")}')
+            for t in extras:
+                lines.append(f'  נמחקת: {t.get("title")} (id ...{(t.get("id") or "")[-6:]})')
+        if not confirm:
+            total = sum(len(e) for _, e in plan)
+            return (f"נמצאו {total} כפילויות ב-{len(plan)} קבוצות:\n" + "\n".join(lines)
+                    + "\n\nזו רק הצגה - עדיין לא נמחק כלום. "
+                      "אם הוא מאשר את התוכנית בדיוק ככה, קרא שוב עם confirm=True.")
+        deleted = 0
+        for _, extras in plan:
+            for t in extras:
+                msgraph.graph("DELETE", f"/me/todo/lists/{target['id']}/tasks/{t['id']}")
+                deleted += 1
+        return f"🗑️ נמחקו {deleted} כפילויות; נשארה משימה אחת מכל חנות:\n" + "\n".join(lines)
+    except Exception as e:
+        return _fail("לנקות כפילויות", e)
+
+
 def delete_todo_task(task: str, list_name: str = "") -> str:
     """Deletes a Microsoft To Do task permanently. To Do has no bin for tasks.
 

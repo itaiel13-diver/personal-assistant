@@ -60,7 +60,8 @@ PACK_MEMBERS = {
     "todo": (
         "list_todo_lists", "list_todo_tasks", "search_todo_tasks",
         "create_todo_task", "update_todo_task", "complete_todo_task",
-        "reopen_todo_task", "delete_todo_task", "add_todo_checklist_item",
+        "reopen_todo_task", "delete_todo_task", "dedupe_todo_tasks",
+        "add_todo_checklist_item",
         "create_todo_list", "delete_todo_list", "todo_connection_status",
     ),
     "calendar": (

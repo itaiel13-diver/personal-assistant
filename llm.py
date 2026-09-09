@@ -24,6 +24,7 @@ because the callers are heartbeat routines: an assistant that cannot think must
 go quiet, never take the endpoint down with it.
 """
 
+import base64
 import json
 import logging
 import os
@@ -45,6 +46,8 @@ PROVIDERS = (
         "key_env": "GEMINI_API_KEY",
         "model_env": "GEMINI_MODEL_NAME",
         "model": "gemini-3.6-flash",
+        # The chat model is already multimodal, so vision needs no second id.
+        "vision": True,
     },
     {
         "name": "groq",
@@ -57,6 +60,17 @@ PROVIDERS = (
         # still pins GROQ_MODEL_NAME to the old id it wins over this default -
         # the variable must be cleared there, not just here.
         "model": "openai/gpt-oss-120b",
+        # gpt-oss-120b is text-only; photos go to a vision model instead.
+        # Groq's vision line churns as fast as its text line (llama-4-scout is
+        # already gone), so the id is overridable from Render.
+        "vision": True,
+        "vision_model": "qwen/qwen3.6-27b",
+        "vision_model_env": "GROQ_VISION_MODEL_NAME",
+        # Qwen thinks in <think> tags before answering, and on the free tier
+        # that thinking alone can eat the whole output budget (1,000 tokens a
+        # minute) while the reply itself never arrives. "none" buys a direct
+        # answer. Vision-only: the text tier's behaviour stays untouched.
+        "vision_extra": {"reasoning_effort": "none"},
     },
     {
         "name": "openrouter",
@@ -64,6 +78,8 @@ PROVIDERS = (
         "key_env": "OPENROUTER_API_KEY",
         "model_env": "OPENROUTER_MODEL_NAME",
         "model": "meta-llama/llama-3.3-70b-instruct:free",
+        # The default free model is text-only; never show it a photo.
+        "vision": False,
     },
 )
 
@@ -77,20 +93,24 @@ def _model_for(provider: dict) -> str:
     return os.environ.get(provider["model_env"]) or provider["model"]
 
 
-def _ask_one(provider: dict, messages: list, max_tokens: int, temperature: float) -> str:
+def _ask_one(provider: dict, messages: list, max_tokens: int, temperature: float,
+             model: str = None, extra: dict = None) -> str:
     key = os.environ.get(provider["key_env"])
+    body = {
+        "model": model or _model_for(provider),
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if extra:
+        body.update(extra)
     response = requests.post(
         provider["url"],
         headers={
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": _model_for(provider),
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        },
+        json=body,
         timeout=TIMEOUT_SECONDS,
     )
     response.raise_for_status()
@@ -141,6 +161,80 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
         logger.info("No LLM provider is configured - set GROQ_API_KEY for a free 1,000/day tier")
     else:
         logger.error(f"Every LLM provider failed: {', '.join(tried)}")
+    return None
+
+
+
+def _vision_model_for(provider: dict) -> str | None:
+    """The model to show a photo to, or None when the provider is text-only."""
+    if not provider.get("vision"):
+        return None
+    env_name = provider.get("vision_model_env")
+    if env_name and os.environ.get(env_name):
+        return os.environ[env_name]
+    return provider.get("vision_model") or _model_for(provider)
+
+
+_THINK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> str:
+    """Thinking models wrap their reasoning in <think> tags; the reply is what
+    remains. A reply that is only thinking counts as empty, like any other."""
+    return _THINK.sub("", text or "").strip()
+
+
+def ask_image(image_bytes: bytes, mime_type: str, prompt: str, system: str = "",
+              max_tokens: int = 2000, temperature: float = 0.2, skip: tuple = ()) -> str | None:
+    """ask(), for a photo: the first vision-capable provider with quota answers.
+
+    The image travels inline as a base64 data URI, the one shape every
+    OpenAI-compatible vision endpoint agrees on. Providers whose configured
+    model is text-only are skipped outright - sending them pixels is how a
+    photo gets a blind description, the exact failure this function exists to
+    prevent. None means no vision tier answered, and the caller must say so
+    honestly rather than guess what the photo shows.
+
+    max_tokens is generous on purpose: the current vision models think inside
+    <think> tags before answering, and the budget must pay for both the
+    thinking and the reply - a tight cap truncates inside the thinking and
+    returns nothing at all.
+    """
+    data_uri = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": data_uri}},
+        {"type": "text", "text": prompt},
+    ]})
+
+    tried = []
+    for provider in PROVIDERS:
+        if provider["name"] in skip:
+            continue
+        model = _vision_model_for(provider)
+        if not model:
+            continue
+        if not os.environ.get(provider["key_env"]):
+            continue
+        tried.append(provider["name"])
+        try:
+            answer = _strip_thinking(
+                _ask_one(provider, messages, max_tokens, temperature,
+                         model=model, extra=provider.get("vision_extra")))
+            if answer:
+                logger.info(f"Image answered by {provider['name']} ({model})")
+                return answer
+            logger.warning(f"{provider['name']} returned an empty answer; falling through")
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            logger.warning(f"{provider['name']} refused the image with HTTP {status}; falling through")
+        except Exception as e:
+            logger.warning(f"{provider['name']} failed on the image ({e}); falling through")
+
+    if tried:
+        logger.error(f"Every vision provider failed: {', '.join(tried)}")
     return None
 
 

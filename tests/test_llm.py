@@ -39,7 +39,7 @@ def calls(monkeypatch):
 
     def fake_post(url, headers=None, json=None, timeout=None):
         seen.append({"url": url, "model": (json or {}).get("model"),
-                     "messages": (json or {}).get("messages")})
+                     "messages": (json or {}).get("messages"), "body": json})
         reply = queue.pop(0) if queue else FakeResponse()
         if isinstance(reply, Exception):
             raise reply
@@ -155,3 +155,64 @@ def test_ask_json_survives_a_sentence_of_preamble(keys, calls):
 def test_ask_json_returns_none_for_an_unparseable_answer(keys, calls):
     calls["queue"].append(FakeResponse(content="I would rather explain it in words"))
     assert llm.ask_json("שאלה") is None
+
+
+# --- photos -----------------------------------------------------------------
+
+
+def test_a_photo_is_sent_inline_to_the_first_vision_provider(keys, calls):
+    assert llm.ask_image(b"px", "image/jpeg", "מה בתמונה?") == "בסדר גמור"
+    content = calls["seen"][0]["messages"][0]["content"]
+    assert content[0]["type"] == "image_url"
+    assert content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert content[1] == {"type": "text", "text": "מה בתמונה?"}
+
+
+def test_groq_gets_its_vision_model_not_the_text_default(keys, calls):
+    """gpt-oss-120b cannot see; showing it a photo was the original bug."""
+    calls["queue"].append(FakeResponse(status=429))
+    calls["queue"].append(FakeResponse(content="רואה"))
+    assert llm.ask_image(b"px", "image/jpeg", "מה בתמונה?", skip=()) == "רואה"
+    assert calls["seen"][1]["model"] == "qwen/qwen3.6-27b"
+    assert "api.groq.com" in calls["seen"][1]["url"]
+
+
+def test_a_text_only_provider_is_never_shown_a_photo(monkeypatch, calls):
+    """OpenRouter's default free model is text-only, so with only its key set
+    there is simply no vision tier - None, and not a single request."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "o")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    assert llm.ask_image(b"px", "image/jpeg", "מה בתמונה?") is None
+    assert calls["seen"] == []
+
+
+def test_the_vision_model_can_be_overridden_from_the_environment(keys, calls, monkeypatch):
+    """Groq's vision line churns; Render must be able to pin the next id."""
+    monkeypatch.setenv("GROQ_VISION_MODEL_NAME", "vendor/next-vision-9b")
+    llm.ask_image(b"px", "image/png", "מה בתמונה?", skip=("gemini",))
+    assert calls["seen"][0]["model"] == "vendor/next-vision-9b"
+
+
+def test_thinking_blocks_are_stripped_from_the_answer(keys, calls):
+    calls["queue"].append(FakeResponse(content="<think>מרעיין לעצמו</think> התשובה"))
+    assert llm.ask_image(b"px", "image/jpeg", "מה בתמונה?") == "התשובה"
+
+
+def test_an_answer_that_is_only_thinking_falls_through(keys, calls):
+    calls["queue"].append(FakeResponse(content="<think>רק חשיבה</think>"))
+    calls["queue"].append(FakeResponse(content="תשובה אמיתית"))
+    assert llm.ask_image(b"px", "image/jpeg", "מה בתמונה?") == "תשובה אמיתית"
+
+
+def test_every_vision_provider_failing_returns_none(keys, calls):
+    calls["queue"].append(FakeResponse(status=429))
+    calls["queue"].append(FakeResponse(status=500))
+    assert llm.ask_image(b"px", "image/jpeg", "מה בתמונה?") is None
+
+
+def test_the_groq_vision_call_turns_off_thinking(keys, calls):
+    """Thinking burns the free tier's whole output budget before the answer
+    arrives; the vision call asks for a direct reply instead."""
+    llm.ask_image(b"px", "image/jpeg", "מה בתמונה?", skip=("gemini",))
+    assert calls["seen"][0]["body"].get("reasoning_effort") == "none"

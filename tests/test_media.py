@@ -304,10 +304,44 @@ def test_stored_history_carries_a_marker_instead_of_the_image_bytes(fake_client,
     assert "מה זה?" in stored and "נראה טוב" in stored
 
 
-def test_an_image_after_the_daily_quota_gets_an_honest_answer(fake_client, monkeypatch):
-    """The fallback tiers are text-only, so a photo past the quota must say so -
-    a blind 'description' would be the worst available failure."""
+def test_an_image_after_the_daily_quota_goes_to_a_vision_fallback(fake_client, monkeypatch):
+    """Gemini's 429 is no longer the end of a photo: a spare tier's vision
+    model sees the same bytes and answers, and the turn is still recorded."""
+    saved = []
+    monkeypatch.setattr(assistant.storage, "enabled", lambda: True)
+    monkeypatch.setattr(assistant.storage, "append_user_turn",
+                        lambda sender, text: saved.append(("user", text)))
+    monkeypatch.setattr(assistant.storage, "append_model_turn",
+                        lambda sender, text: saved.append(("model", text)))
+    monkeypatch.setattr(assistant.storage, "load_history", lambda sender: [])
+    assistant._fallback_sessions.clear()
+
+    quota_error = assistant.genai_errors.ClientError(429, {"error": {"message": "quota"}})
+    chat = MagicMock()
+    chat.send_message.side_effect = quota_error
+    fake_client.chats.create.return_value = chat
+
+    seen = {}
+    def fake_ask_image(image_bytes, mime_type, prompt, system="", skip=()):
+        seen.update(bytes=image_bytes, mime=mime_type, skip=skip)
+        return "זו תצוגת גלקסי בחנות"
+    monkeypatch.setattr(assistant.llm, "ask_image", fake_ask_image)
+
+    reply = assistant.handle_image_message(b"img-bytes", "image/jpeg", "מה זה?", sender_id="sender-i")
+
+    assert reply == "זו תצוגת גלקסי בחנות"
+    assert seen["bytes"] == b"img-bytes" and seen["mime"] == "image/jpeg"
+    assert seen["skip"] == ("gemini",), "Gemini already said 429 - asking it again wastes a round trip"
+    assert saved[0][0] == "user" and "תמונה" in saved[0][1] and "מה זה?" in saved[0][1]
+    assert saved[1] == ("model", "זו תצוגת גלקסי בחנות")
+    assistant._fallback_sessions.clear()
+
+
+def test_an_image_with_no_vision_tier_left_gets_an_honest_answer(fake_client, monkeypatch):
+    """Every vision provider refusing still ends honestly - never a blind
+    'description', which would be the worst available failure."""
     monkeypatch.setattr(assistant.storage, "enabled", lambda: False)
+    monkeypatch.setattr(assistant.llm, "ask_image", lambda *a, **k: None)
     assistant._fallback_sessions.clear()
 
     quota_error = assistant.genai_errors.ClientError(429, {"error": {"message": "quota"}})
@@ -317,7 +351,7 @@ def test_an_image_after_the_daily_quota_gets_an_honest_answer(fake_client, monke
 
     reply = assistant.handle_image_message(b"img-bytes", "image/jpeg", "", sender_id="sender-i")
     assert "מכסת" in reply
-    assert "תמונות" in reply
+    assert "מודל הגיבוי" in reply
     assistant._fallback_sessions.clear()
 
 

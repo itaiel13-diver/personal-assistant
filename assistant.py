@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -573,8 +574,31 @@ def _get_session(sender_id: str):
     return _fallback_sessions[sender_id][0]
 
 
+# A 429 whose asked-for wait is short is the per-minute input-token cap, not
+# the daily quota: worth one patient retry before the spare tier takes over
+# and tells Itai the day is over. Longer waits mean real daily exhaustion.
+_MINUTE_QUOTA_MAX_WAIT_SECONDS = 65
+
+
+def _asked_retry_delay_seconds(error) -> float | None:
+    """How long Google asked for before a retry, if it said at all."""
+    match = re.search(r"retry in ([\d.]+)s", str(error))
+    if not match:
+        match = re.search(r"retryDelay['\"]*\s*:\s*['\"](\d+(?:\.\d+)?)s", str(error))
+    return float(match.group(1)) if match else None
+
+
 def _send_with_retry(chat, text: str, attempts: int = 3):
-    return _retry_on_server_error(lambda: chat.send_message(text), attempts=attempts)
+    send = lambda: chat.send_message(text)
+    try:
+        return _retry_on_server_error(send, attempts=attempts)
+    except genai_errors.ClientError as e:
+        delay = _asked_retry_delay_seconds(e)
+        if getattr(e, "code", None) == 429 and delay is not None and delay <= _MINUTE_QUOTA_MAX_WAIT_SECONDS:
+            logger.warning(f"Gemini per-minute quota - waiting {delay:.0f}s and retrying once")
+            time.sleep(delay + 1)
+            return _retry_on_server_error(send, attempts=attempts)
+        raise
 
 
 def _plain_history(sender_id: str, turns: int = 12) -> str:
@@ -594,7 +618,8 @@ def _plain_history(sender_id: str, turns: int = 12) -> str:
     return "\n".join(lines)
 
 
-def _answer_without_gemini(incoming_text: str, sender_id: str) -> str | None:
+def _answer_without_gemini(incoming_text: str, sender_id: str,
+                           extra_context: str = "") -> str | None:
     """Answers on a spare free tier once Gemini's daily quota is gone.
 
     Two modes. A message that names something actionable - a task, the
@@ -605,12 +630,16 @@ def _answer_without_gemini(incoming_text: str, sender_id: str) -> str | None:
     Gemini. Everything else keeps the old tool-less answer, because paying
     thousands of schema tokens for small talk is how a free tier dies twice.
     """
-    packs = tool_bridge.select_packs(incoming_text)
+    # Short replies carry no keywords of their own - "כן, תוסיף" only makes
+    # sense against the last few turns, so the pack choice sees them too.
+    packs = tool_bridge.select_packs(
+        f"{incoming_text}\n{_plain_history(sender_id, turns=4)}")
     if packs:
         registry = tool_bridge.build_registry(tools_list)
         schemas = tool_bridge.tools_for(packs, registry)
         reply = llm.ask_with_tools(
-            f"{_plain_history(sender_id)}\nItai: {incoming_text}",
+            f"{_plain_history(sender_id)}\n{extra_context}\nItai: {incoming_text}" if extra_context
+            else f"{_plain_history(sender_id)}\nItai: {incoming_text}",
             system=(
                 SYSTEM_PROMPT
                 + _load_memory_context()
@@ -625,6 +654,10 @@ def _answer_without_gemini(incoming_text: str, sender_id: str) -> str | None:
             ),
             tools=schemas,
             call_tool=lambda name, args: tool_bridge.dispatch(registry, name, args),
+            # A photo of a week's schedule can mean ten creates plus a list
+            # first; the cap counts requests against the free daily budget,
+            # not time, so a batch day needs room.
+            max_rounds=8,
             max_tokens=800,
             temperature=0.3,
             skip=("gemini",),
@@ -701,6 +734,16 @@ def _describe_image_without_gemini(image_bytes: bytes, mime_type: str, caption: 
     )
     if not reply:
         return None
+    # A caption that asks for an ACTION ("תוסיף את המשימות שבתמונה") is not
+    # answered by a description: the extraction goes into the tool loop, which
+    # executes it under the same confirmation rules a typed request gets.
+    if caption and tool_bridge.select_packs(caption):
+        acted = _answer_without_gemini(
+            caption, sender_id,
+            extra_context=f"[תוכן שחולץ מהתמונה שאיתי שלח]:\n{reply}")
+        if acted:
+            logger.info(f"Image caption acted on with tools {tool_bridge.select_packs(caption)} for {sender_id}")
+            return acted
     logger.info(f"Image answered on the fallback tier for {sender_id}")
     if storage.enabled():
         # The marker keeps Postgres free of image bytes here too; the caption

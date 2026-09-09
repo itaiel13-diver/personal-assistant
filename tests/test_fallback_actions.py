@@ -118,3 +118,23 @@ def test_photo_with_plain_caption_stays_a_description(monkeypatch):
 
 def test_pack_selection_broader_list_word():
     assert "todo" in tool_bridge.select_packs("תוסיף את זה לרשימה שלי")
+
+
+def test_daily_cap_never_waits(monkeypatch):
+    """The per-day quotaId can arrive with a short retryDelay (the next minute
+    boundary) - waiting 58s for midnight's reset is a lie, so it must raise
+    straight into the fallback."""
+    sleeps = []
+    monkeypatch.setattr(assistant.time, "sleep", lambda s: sleeps.append(s))
+    err = assistant.genai_errors.ClientError(
+        429, {"error": {"message": "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. Please retry in 58.4s."}},
+        MagicMock())
+    chat = MagicMock()
+    chat.send_message.side_effect = err
+    try:
+        assistant._send_with_retry(chat, "hi")
+        assert False, "should have raised"
+    except assistant.genai_errors.ClientError:
+        pass
+    assert sleeps == []
+    assert chat.send_message.call_count == 1

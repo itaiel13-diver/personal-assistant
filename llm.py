@@ -31,6 +31,7 @@ import os
 import re
 
 import requests
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,25 @@ def _shrink_for_tpm(messages: list) -> list:
     return shrunk
 
 
+# A provider that says "too many requests, back in N seconds" and names a
+# short N is throttling the minute, not rejecting the request - worth one
+# patient retry. A longer wait means a real daily budget; the next provider
+# is the better bet.
+_429_MAX_WAIT_SECONDS = 60
+
+
+def _retry_after_seconds(error) -> float | None:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    raw = headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def ask(prompt: str, system: str = "", max_tokens: int = 600,
         temperature: float = 0.2, skip: tuple = ()) -> str | None:
     """Asks the first provider that has quota, and returns None if none do.
@@ -226,9 +246,23 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
                 except Exception as e2:
                     logger.warning(f"{provider['name']} failed even trimmed ({e2}); falling through")
                 continue
-            # 429 is the daily free-tier quota and will not clear on a retry;
-            # every other error is equally a reason to ask somebody else. There
-            # is no retry here on purpose - the next provider IS the retry.
+            # A 429 with a short Retry-After is the minute's throttle, not the
+            # day's budget: wait it out once before asking somebody else. A
+            # 429 without one (or a long one) is real exhaustion - the next
+            # provider IS the retry.
+            wait = _retry_after_seconds(e)
+            if status == 429 and wait is not None and wait <= _429_MAX_WAIT_SECONDS:
+                logger.warning(f"{provider['name']} throttled for {wait:.0f}s; waiting once")
+                time.sleep(wait + 1)
+                try:
+                    answer = _ask_one(provider, messages, max_tokens, temperature)
+                    if answer:
+                        logger.info(f"LLM answered by {provider['name']} after waiting out the throttle")
+                        return answer
+                    logger.warning(f"{provider['name']} returned an empty answer after the wait; falling through")
+                except Exception as e2:
+                    logger.warning(f"{provider['name']} still throttled ({e2}); falling through")
+                continue
             logger.warning(f"{provider['name']} refused with HTTP {status}; falling through")
         except Exception as e:
             logger.warning(f"{provider['name']} failed ({e}); falling through")
@@ -287,6 +321,15 @@ def ask_with_tools(prompt: str, system: str, tools: list, call_tool,
                         body = _ask_one_full(provider, working, max_tokens, temperature, tools=tools)
                     except Exception as e2:
                         logger.warning(f"{provider['name']} failed even trimmed ({e2}); falling through")
+                        break
+                elif status == 429 and (_retry_after_seconds(e) or 9e9) <= _429_MAX_WAIT_SECONDS:
+                    wait = _retry_after_seconds(e) + 1
+                    logger.warning(f"{provider['name']} throttled for {wait:.0f}s; waiting once")
+                    time.sleep(wait)
+                    try:
+                        body = _ask_one_full(provider, working, max_tokens, temperature, tools=tools)
+                    except Exception as e2:
+                        logger.warning(f"{provider['name']} still throttled ({e2}); falling through")
                         break
                 else:
                     logger.warning(f"{provider['name']} refused with HTTP {status}; falling through")

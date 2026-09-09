@@ -391,3 +391,18 @@ def test_every_tool_is_registered_with_the_model():
     registered = {getattr(f, "__name__", "") for f in assistant.tools_list}
     for tool, _ in EVERY_TOOL:
         assert tool.__name__ in registered
+
+
+def test_a_duplicate_open_task_is_not_recreated(api):
+    """A batch that died mid-loop gets retried whole; the tasks that already
+    landed must not double."""
+    out = todo_tools.create_todo_task("חלב", "קניות")
+    assert "כבר קיימת" in out
+    assert all(not (m == "POST" and p.endswith("/tasks")) for m, p, _ in api.writes)
+
+
+def test_a_completed_task_with_the_same_title_does_not_block(api):
+    """"להזמין רכב לטיפול" sits completed on the default list - wanting a fresh
+    open one is exactly the point of recreating it."""
+    out = todo_tools.create_todo_task("להזמין רכב לטיפול")
+    assert "✅" in out

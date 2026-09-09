@@ -387,3 +387,34 @@ def test_without_owner_phone_the_gate_is_open(client, monkeypatch):
         r, _ = _post_text(client, "972500000001")
     assert r.status_code == 200
     mock_handle.assert_called_once()
+
+
+def test_a_duplicate_delivery_is_acknowledged_without_reprocessing(client):
+    """Meta retries a slow webhook until it gets a fast 200 - the retry must
+    be a no-op, or every slow answer becomes several identical WhatsApps."""
+    body = json.dumps(_text_message_payload("972500000000", "שלום")).encode()
+    with patch("webhook_server.handle_whatsapp_message", return_value="תשובת בדיקה") as mock_handle, \
+         patch("webhook_server._send_whatsapp_reply") as mock_send:
+        for _ in range(3):
+            r = client.post(
+                "/webhook", data=body, content_type="application/json",
+                headers={"X-Hub-Signature-256": _sign(body)},
+            )
+            assert r.status_code == 200
+    mock_handle.assert_called_once()
+    mock_send.assert_called_once()
+
+
+def test_a_new_message_after_a_duplicate_still_processes(client):
+    first = json.dumps(_text_message_payload("972500000000", "אחת")).encode()
+    second_payload = _text_message_payload("972500000000", "שתיים")
+    second_payload["entry"][0]["changes"][0]["value"]["messages"][0]["id"] = "wamid.other"
+    second = json.dumps(second_payload).encode()
+    with patch("webhook_server.handle_whatsapp_message", return_value="תשובה") as mock_handle, \
+         patch("webhook_server._send_whatsapp_reply"):
+        for body in (first, first, second):
+            client.post(
+                "/webhook", data=body, content_type="application/json",
+                headers={"X-Hub-Signature-256": _sign(body)},
+            )
+    assert mock_handle.call_count == 2

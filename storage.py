@@ -115,6 +115,12 @@ def _ensure_schema(conn) -> None:
         return
     with conn.cursor() as cur:
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                message_id  TEXT PRIMARY KEY,
+                processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 sender_id  TEXT PRIMARY KEY,
                 history    JSONB NOT NULL,
@@ -203,6 +209,44 @@ def _ensure_schema(conn) -> None:
         """)
     conn.commit()
     _schema_ready = True
+
+
+def message_seen(message_id: str) -> bool:
+    """True when this WhatsApp message id already reached the handler.
+
+    Meta retries a webhook delivery until it gets a fast 200, so a slow
+    answer arrives again and again. A check that ERRORS returns False: a
+    duplicate answer is bad, a message never answered is worse.
+    """
+    if not enabled() or not message_id:
+        return False
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM processed_messages WHERE message_id = %s",
+                            (message_id,))
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Failed to check processed message: {e}")
+        return False
+
+
+def mark_message(message_id: str) -> None:
+    """Records a WhatsApp message id as received, before handling starts."""
+    if not enabled() or not message_id:
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO processed_messages (message_id) VALUES (%s) "
+                    "ON CONFLICT (message_id) DO NOTHING",
+                    (message_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to mark processed message: {e}")
 
 
 def load_history(sender_id: str) -> list:

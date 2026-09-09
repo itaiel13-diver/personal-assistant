@@ -628,6 +628,47 @@ def _answer_without_gemini(incoming_text: str, sender_id: str) -> str | None:
     return reply
 
 
+def _describe_image_without_gemini(image_bytes: bytes, mime_type: str, caption: str,
+                                   sender_id: str) -> str | None:
+    """Answers a photo on a spare tier's vision model once Gemini's quota is gone.
+
+    The same reduced assistant as the text fallback - flattened history, no
+    tools - but the pixels reach a model that can actually see them. None means
+    no vision tier answered either, and the caller must say so honestly.
+    """
+    caption = (caption or "").strip()
+    question = caption if caption else (
+        "איתי שלח תמונה בלי כיתוב. תסתכל עליה ותספר בקצרה מה אתה רואה, "
+        "ואם יש בה משהו שדורש תשומת לב - תגיד.")
+    history = _plain_history(sender_id)
+    reply = llm.ask_image(
+        image_bytes,
+        base_mime(mime_type) or "image/jpeg",
+        f"{history}\nItai: {question}" if history else question,
+        system=(
+            SYSTEM_PROMPT
+            + _load_memory_context()
+            + _date_context()
+            + "\n\nIMPORTANT, ONLY FOR THIS REPLY: your tools are unavailable right now, "
+            "so you cannot read mail, search the web, or touch the calendar or Drive. "
+            "Answer from the photo, the conversation and your memory alone, in Hebrew. "
+            "If the answer needs a tool, say plainly that the daily AI quota ran out and "
+            "you will be able to check it later - never guess."
+        ),
+        skip=("gemini",),
+    )
+    if not reply:
+        return None
+    logger.info(f"Image answered on the fallback tier for {sender_id}")
+    if storage.enabled():
+        # The marker keeps Postgres free of image bytes here too; the caption
+        # stays as text so the turn still makes sense tomorrow.
+        marker = _MEDIA_PLACEHOLDERS["image"] + (f" {caption}" if caption else "")
+        storage.append_user_turn(sender_id, marker)
+        storage.append_model_turn(sender_id, reply)
+    return reply
+
+
 # 5. מנוע השיחה הראשי
 def _quota_dead_end_message() -> str:
     """The message after Gemini's 429 AND every fallback provider said no.
@@ -775,8 +816,9 @@ def handle_image_message(image_bytes: bytes, mime_type: str, caption: str = "",
     the actual pixels is the entire point - and is swapped for a text marker
     before the history is stored, so Postgres never carries the bytes.
 
-    The fallback tiers in llm.py are text-only, so a photo that arrives after
-    Gemini's daily quota ran out gets an honest answer rather than a blind
+    When Gemini's daily quota is gone, a spare tier's vision model
+    (_describe_image_without_gemini) takes the photo instead; if no vision
+    tier answers, the sender gets an honest answer rather than a blind
     description.
     """
     try:
@@ -796,8 +838,11 @@ def handle_image_message(image_bytes: bytes, mime_type: str, caption: str = "",
     except genai_errors.ClientError as e:
         logger.error(f"Gemini client error on image for sender {sender_id}: {e}")
         if getattr(e, "code", None) == 429:
-            return ("קיבלתי את התמונה, אבל נגמרה מכסת ה-AI היומית והמודל החלופי "
-                    "לא יודע לקרוא תמונות. אפשר לשלוח אותה שוב מחר, או לתאר במילים.")
+            spare = _describe_image_without_gemini(image_bytes, mime_type, caption, sender_id)
+            if spare:
+                return spare
+            return ("קיבלתי את התמונה, אבל נגמרה מכסת ה-AI היומית וגם מודל הגיבוי "
+                    "לא הצליח לקרוא אותה. אפשר לשלוח אותה שוב מחר, או לתאר במילים.")
         return "מצטער, יש תקלה בחיבור ל-AI ולא הצלחתי לראות את התמונה. נסה/י שוב בעוד רגע."
     except Exception as e:
         logger.error(f"Gemini image call failed for sender {sender_id}: {e}")

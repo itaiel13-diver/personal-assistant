@@ -789,10 +789,17 @@ def _transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
             ],
         ))
         transcript = (response.text or "").strip()
-        return transcript or None
+        if transcript:
+            return transcript
+        logger.warning("Gemini returned an empty transcript; trying the fallback tier")
     except Exception as e:
-        logger.error(f"Voice transcription failed: {e}")
-        return None
+        logger.error(f"Gemini transcription failed: {e}; trying the fallback tier")
+    # Whisper on Groq is metered in audio seconds, not tokens, so a voice note
+    # can be heard even on a day the whole text quota is gone.
+    transcript = llm.transcribe(audio_bytes, base_mime(mime_type) or "audio/ogg")
+    if transcript:
+        logger.info("Voice note transcribed on the fallback tier")
+    return transcript
 
 
 def handle_voice_message(audio_bytes: bytes, mime_type: str, sender_id: str = "default") -> str:

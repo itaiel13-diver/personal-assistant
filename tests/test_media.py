@@ -465,3 +465,31 @@ def test_a_two_sheet_workbook_reads_both_tabs():
     text = attachment_readers.extract_text("מכירות.xlsx", buf.getvalue())
     assert "ינואר" in text and "פברואר" in text
     assert "רמלה" in text and "לוד" in text
+
+
+def test_a_voice_note_falls_back_to_whisper_when_gemini_is_out(fake_client, monkeypatch):
+    """Gemini's 429 must not make the bot deaf: the transcript comes from the
+    fallback tier and the reply then goes through the normal text path."""
+    monkeypatch.setattr(assistant.storage, "enabled", lambda: False)
+    assistant._fallback_sessions.clear()
+
+    quota_error = assistant.genai_errors.ClientError(429, {"error": {"message": "quota"}})
+    fake_client.models.generate_content.side_effect = quota_error
+    monkeypatch.setattr(assistant.llm, "transcribe", lambda b, m: "תקבע לי פגישה מחר בחמש")
+
+    chat = MagicMock()
+    chat.send_message.return_value = MagicMock(text="נרשם")
+    fake_client.chats.create.return_value = chat
+
+    reply = assistant.handle_voice_message(b"ogg-bytes", "audio/ogg", sender_id="sender-v")
+    assert reply == "נרשם"
+    sent = chat.send_message.call_args.args[0]
+    assert "תקבע לי פגישה מחר בחמש" in sent
+    assistant._fallback_sessions.clear()
+
+
+def test_a_voice_note_no_tier_can_hear_asks_for_a_resend(fake_client, monkeypatch):
+    fake_client.models.generate_content.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(assistant.llm, "transcribe", lambda b, m: None)
+    reply = assistant.handle_voice_message(b"ogg-bytes", "audio/ogg", sender_id="sender-v")
+    assert "שוב" in reply

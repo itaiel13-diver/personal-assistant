@@ -406,6 +406,18 @@ def todo_maintenance():
                 importance=task.get("importance", "normal"),
             ))
         return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
+    if action == "rebuild-context":
+        # Drift repair for the context layer: re-indexes turns from the raw
+        # history and drops the derivable topic digests. No summariser here -
+        # digests re-accrue through normal post-turn compaction. Pins and raw
+        # history are untouched.
+        import context_manager
+        sender = payload.get("sender", "")
+        if not sender:
+            return Response("missing sender", status=400)
+        stats = context_manager.rebuild(sender)
+        return Response("\n".join(f"{k}: {v}" for k, v in stats.items()),
+                        mimetype="text/plain; charset=utf-8")
     abort(400)
 
 

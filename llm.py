@@ -184,6 +184,13 @@ def _shrink_for_tpm(messages: list) -> list:
 # is the better bet.
 _429_MAX_WAIT_SECONDS = 60
 
+# Total a single call may spend asleep on throttles. The webhook worker is
+# killed at 120s and an unanswered message is worse than a degraded one -
+# PR #15 marks deliveries processed up front, so a killed worker means the
+# sender never hears back at all. Waits that would push the call past this
+# budget are skipped in favour of the next provider (or the dead-end reply).
+_WAIT_BUDGET_SECONDS = 75.0
+
 
 def _retry_after_seconds(error) -> float | None:
     response = getattr(error, "response", None)
@@ -215,6 +222,7 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
     messages.append({"role": "user", "content": prompt})
 
     tried = []
+    started = time.monotonic()
     for provider in PROVIDERS:
         if provider["name"] in skip:
             continue
@@ -252,6 +260,9 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
             # provider IS the retry.
             wait = _retry_after_seconds(e)
             if status == 429 and wait is not None and wait <= _429_MAX_WAIT_SECONDS:
+                if time.monotonic() - started + wait + 1 > _WAIT_BUDGET_SECONDS:
+                    logger.warning(f"{provider['name']} throttle wait ({wait:.0f}s) would blow the {_WAIT_BUDGET_SECONDS:.0f}s budget; falling through")
+                    continue
                 logger.warning(f"{provider['name']} throttled for {wait:.0f}s; waiting once")
                 time.sleep(wait + 1)
                 try:
@@ -298,6 +309,7 @@ def ask_with_tools(prompt: str, system: str, tools: list, call_tool,
     base_messages.append({"role": "user", "content": prompt})
 
     tried = []
+    started = time.monotonic()
     for provider in PROVIDERS:
         if provider["name"] in skip:
             continue
@@ -324,6 +336,9 @@ def ask_with_tools(prompt: str, system: str, tools: list, call_tool,
                         break
                 elif status == 429 and (_retry_after_seconds(e) or 9e9) <= _429_MAX_WAIT_SECONDS:
                     wait = _retry_after_seconds(e) + 1
+                    if time.monotonic() - started + wait > _WAIT_BUDGET_SECONDS:
+                        logger.warning(f"{provider['name']} throttle wait ({wait:.0f}s) would blow the {_WAIT_BUDGET_SECONDS:.0f}s budget; falling through")
+                        break
                     logger.warning(f"{provider['name']} throttled for {wait:.0f}s; waiting once")
                     time.sleep(wait)
                     try:

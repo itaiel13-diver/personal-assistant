@@ -146,6 +146,22 @@ def _ensure_schema(conn) -> None:
                 PRIMARY KEY (sender_id, topic)
             )
         """)
+        # One row per conversation turn: the retrieval substrate. topics are
+        # persisted per turn so the taxonomy is data (re-tagging can run
+        # offline), and to_tsvector over text gives real full-text retrieval
+        # instead of Python word overlap. Derivable from conversations -
+        # wiping it only costs a re-index.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS turn_index (
+                sender_id  TEXT NOT NULL,
+                idx        INT  NOT NULL,
+                speaker    TEXT NOT NULL DEFAULT '',
+                text       TEXT NOT NULL DEFAULT '',
+                topics     TEXT[] NOT NULL DEFAULT '{}',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (sender_id, idx)
+            )
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS memory (
                 key        TEXT PRIMARY KEY,
@@ -831,10 +847,17 @@ def save_state(sender_id: str, summary=None, pin=None, compacted_count=None) -> 
 def pin_fact(sender_id: str, key: str, value: str) -> None:
     """One fact that must survive every compaction verbatim: a pending plan,
     an approval he gave, an id a later step depends on. Pins render into every
-    context bundle ahead of everything else and are never summarised."""
+    context bundle ahead of everything else and are never summarised.
+
+    Corrections supersede by key: writing the same key again overwrites the
+    old claim and stamps it, so a changed phone number or price never lives
+    on as a stale duplicate. Entries are stored as {value, updated_at}; a
+    bare string is a legacy pin from before timestamps and reads as value."""
+    import datetime
     state = load_state(sender_id)
     pin = dict(state["pin"])
-    pin[key] = value
+    pin[key] = {"value": value,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     save_state(sender_id, pin=pin)
 
 
@@ -884,3 +907,95 @@ def save_topic(sender_id: str, topic: str, summary: str, added_turns: int) -> No
             conn.commit()
     except Exception as e:
         logger.error(f"Failed to save topic {topic} for {sender_id}: {e}")
+
+
+def indexed_turn_count(sender_id: str) -> int:
+    if not enabled():
+        return 0
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM turn_index WHERE sender_id = %s", (sender_id,))
+                return cur.fetchone()[0]
+    except Exception as e:
+        logger.error(f"Failed to count indexed turns for {sender_id}: {e}")
+        return 0
+
+
+def index_turn(sender_id: str, idx: int, speaker: str, text: str, topics) -> None:
+    """Append one turn to the retrieval index. Idempotent on (sender, idx)."""
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO turn_index (sender_id, idx, speaker, text, topics)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (sender_id, idx) DO NOTHING
+                    """,
+                    (sender_id, idx, speaker, text, list(topics)),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to index turn {idx} for {sender_id}: {e}")
+
+
+def clear_turn_index(sender_id: str) -> None:
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM turn_index WHERE sender_id = %s", (sender_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to clear turn index for {sender_id}: {e}")
+
+
+def clear_topics(sender_id: str) -> None:
+    """Drop every topic digest. Digests are derivable from the raw history,
+    so this only forces a rebuild - nothing irreplaceable is lost."""
+    if not enabled():
+        return
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sender_topics WHERE sender_id = %s", (sender_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to clear topics for {sender_id}: {e}")
+
+
+def search_turns(sender_id: str, query: str, limit: int = 6) -> list:
+    """Full-text retrieval over indexed turns. Postgres tsvector ('simple'
+    config - language-neutral, so Hebrew text tokenises without a dictionary).
+    Any failure returns [] and the caller falls back to the Python scorer."""
+    if not enabled() or not (query or "").strip():
+        return []
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT speaker, text,
+                           ts_rank(to_tsvector('simple', text),
+                                   plainto_tsquery('simple', %s)) AS rank
+                    FROM turn_index
+                    WHERE sender_id = %s
+                      AND to_tsvector('simple', text) @@ plainto_tsquery('simple', %s)
+                    ORDER BY rank DESC, idx DESC
+                    LIMIT %s
+                    """,
+                    (query, sender_id, query, limit),
+                )
+                return [f"{sp}: {tx}" for sp, tx, _ in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"Full-text search failed for {sender_id}: {e}")
+        return []

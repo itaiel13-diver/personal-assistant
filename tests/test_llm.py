@@ -216,3 +216,37 @@ def test_the_groq_vision_call_turns_off_thinking(keys, calls):
     arrives; the vision call asks for a direct reply instead."""
     llm.ask_image(b"px", "image/jpeg", "מה בתמונה?", skip=("gemini",))
     assert calls["seen"][0]["body"].get("reasoning_effort") == "none"
+
+
+# --- 413: too many tokens for the free minute --------------------------------
+
+
+def test_a_413_retries_once_with_a_trimmed_prompt(keys, calls):
+    """Groq's free tier refuses a request that alone exceeds the minute's
+    token budget with 413. Trimming beats silence: same provider, smaller
+    prompt, one retry."""
+    calls["queue"].append(FakeResponse(status=413))
+    calls["queue"].append(FakeResponse(content="עניתי אחרי קיצוץ"))
+    fat = "ה" * 9000
+    assert llm.ask(fat) == "עניתי אחרי קיצוץ"
+    assert len(calls["seen"]) == 2
+    first, second = calls["seen"][0], calls["seen"][1]
+    assert first["url"] == second["url"], "the trim retries the same provider before falling through"
+    trimmed = second["messages"][-1]["content"]
+    assert len(trimmed) < len(fat)
+    assert "cut to fit the token budget" in trimmed
+    assert trimmed.endswith("ה" * 100), "the tail - the newest context - survives the cut"
+
+
+def test_a_second_413_falls_through_to_the_next_provider(keys, calls):
+    calls["queue"].append(FakeResponse(status=413))
+    calls["queue"].append(FakeResponse(status=413))
+    calls["queue"].append(FakeResponse(content="groq ענה"))
+    assert llm.ask("שאלה") == "groq ענה"
+    assert "api.groq.com" in calls["seen"][2]["url"]
+
+
+def test_every_provider_413ing_returns_none(keys, calls):
+    for _ in range(6):
+        calls["queue"].append(FakeResponse(status=413))
+    assert llm.ask("ה" * 9000) is None

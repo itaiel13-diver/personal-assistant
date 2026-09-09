@@ -12,6 +12,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import media_tools
 import proactive
 import storage
+import todo_tools
 from assistant import (handle_document_message, handle_image_message,
                          handle_voice_message, handle_whatsapp_message)
 
@@ -365,6 +366,47 @@ h2{{font-size:1.05rem;margin:2rem 0 .5rem}}
 a{{color:#8a5a2b}}
 </style></head><body>
 <h1>{title}</h1><p class="sub">{sub}</p>{body}</body></html>"""
+
+
+@app.route("/admin/todo-maintenance", methods=["GET", "POST"])
+def todo_maintenance():
+    """A model-free maintenance hatch for quota-dead days.
+
+    Every other path to the To Do tools runs through Gemini or Groq, so on a
+    day when both are throttled the assistant cannot even run the cleanup it
+    already knows how to do. This route calls the same todo_tools functions
+    directly - no model, no tokens - under the same shared-secret guard as
+    /tick. GET returns the dedupe dry-run plan; POST action=dedupe-confirm
+    executes it; POST action=refill creates tasks from an explicit list, each
+    still passing create_todo_task's exact-title duplicate guard. The approval
+    step is intentionally not in here: the operator shows the GET plan to Itai
+    and only POSTs the confirm after his yes.
+    """
+    payload = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    key = request.args.get("key", "") or payload.get("key", "")
+    if not TICK_SECRET or key != TICK_SECRET:
+        # Same reasoning as /tick: an unlisted route answers like it does not
+        # exist, not like it is locked.
+        abort(404)
+    if request.method == "GET":
+        return Response(todo_tools.dedupe_todo_tasks(),
+                        mimetype="text/plain; charset=utf-8")
+    action = payload.get("action", "")
+    if action == "dedupe-confirm":
+        return Response(todo_tools.dedupe_todo_tasks(confirm=True),
+                        mimetype="text/plain; charset=utf-8")
+    if action == "refill":
+        lines = []
+        for task in payload.get("tasks", []):
+            lines.append(todo_tools.create_todo_task(
+                title=task.get("title", ""),
+                due=task.get("due", ""),
+                reminder=task.get("reminder", ""),
+                notes=task.get("notes", ""),
+                importance=task.get("importance", "normal"),
+            ))
+        return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
+    abort(400)
 
 
 @app.route("/", methods=["GET"])

@@ -118,6 +118,27 @@ def _ask_one(provider: dict, messages: list, max_tokens: int, temperature: float
     return (body["choices"][0]["message"]["content"] or "").strip()
 
 
+def _shrink_for_tpm(messages: list) -> list:
+    """Trims every oversized text content to its head and tail.
+
+    Groq's free tier counts a request against an 8,000-token-per-minute budget
+    and refuses the whole call with HTTP 413 when one request is too fat - a
+    long conversation injected into the prompt does exactly that. Answering
+    from the ends of the context (persona and instructions live at the head of
+    the system message, the latest exchanges at the tail of the user turn) is
+    strictly better than not answering at all.
+    """
+    shrunk = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str) and len(content) > 5000:
+            content = (content[:2000]
+                       + "\n...[cut to fit the token budget]...\n"
+                       + content[-2000:])
+        shrunk.append({**message, "content": content})
+    return shrunk
+
+
 def ask(prompt: str, system: str = "", max_tokens: int = 600,
         temperature: float = 0.2, skip: tuple = ()) -> str | None:
     """Asks the first provider that has quota, and returns None if none do.
@@ -142,6 +163,7 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
         if not os.environ.get(provider["key_env"]):
             continue
         tried.append(provider["name"])
+        shrunk = False
         try:
             answer = _ask_one(provider, messages, max_tokens, temperature)
             if answer:
@@ -150,6 +172,22 @@ def ask(prompt: str, system: str = "", max_tokens: int = 600,
             logger.warning(f"{provider['name']} returned an empty answer; falling through")
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
+            if status == 413 and not shrunk:
+                # Too many tokens for one minute's budget, not a refusal of the
+                # request itself: retry once with a trimmed prompt before
+                # falling through.
+                logger.warning(f"{provider['name']} refused with HTTP 413; retrying with a trimmed prompt")
+                shrunk = True
+                messages = _shrink_for_tpm(messages)
+                try:
+                    answer = _ask_one(provider, messages, max_tokens, temperature)
+                    if answer:
+                        logger.info(f"LLM answered by {provider['name']} after trimming the prompt")
+                        return answer
+                    logger.warning(f"{provider['name']} returned an empty answer; falling through")
+                except Exception as e2:
+                    logger.warning(f"{provider['name']} failed even trimmed ({e2}); falling through")
+                continue
             # 429 is the daily free-tier quota and will not clear on a retry;
             # every other error is equally a reason to ask somebody else. There
             # is no retry here on purpose - the next provider IS the retry.
